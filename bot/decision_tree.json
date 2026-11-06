@@ -1,0 +1,855 @@
+{
+  "schema": "decision-tree/v2",
+  "name": "asset-aware-donchian-vceb-4h-spot",
+  "treeVersion": "v1.0",
+  "description": "Asset-aware long-only spot decision engine for BTC, ETH and BNB. Strategy A (Donchian) is primary; Strategy C (VCEB volatility-compression breakout) is secondary and configured per asset.",
+  "market": {
+    "venue": "Binance spot",
+    "quoteAsset": "USDT",
+    "interval": "4h",
+    "direction": "long_only",
+    "leverage": false
+  },
+  "assets": {
+    "BTCUSDT": {
+      "enabled": true,
+      "capitalInput": "runtime.capital.BTCUSDT",
+      "strategies": {
+        "A": {
+          "enabled": true
+        },
+        "C": {
+          "enabled": false,
+          "mode": "disabled"
+        }
+      },
+      "notes": "Research configuration: A only; C remains disabled."
+    },
+    "ETHUSDT": {
+      "enabled": true,
+      "capitalInput": "runtime.capital.ETHUSDT",
+      "strategies": {
+        "A": {
+          "enabled": true
+        },
+        "C": {
+          "enabled": true,
+          "mode": "gated",
+          "qualityCompressionRatio": 0.8,
+          "qualityBreakoutAtr": 0.1,
+          "avoidABreakoutAtr": 1.0
+        }
+      },
+      "notes": "Research configuration: A primary plus quality-gated C."
+    },
+    "BNBUSDT": {
+      "enabled": true,
+      "capitalInput": "runtime.capital.BNBUSDT",
+      "strategies": {
+        "A": {
+          "enabled": true
+        },
+        "C": {
+          "enabled": true,
+          "mode": "unrestricted",
+          "qualityCompressionRatio": null,
+          "qualityBreakoutAtr": 0.0,
+          "avoidABreakoutAtr": null
+        }
+      },
+      "notes": "Research configuration: A primary plus unrestricted C."
+    }
+  },
+  "capitalModel": {
+    "mode": "independent_per_asset",
+    "capitalSource": "runtime.capital.<symbol>",
+    "requiredAtRuntime": true,
+    "capitalMustBePositive": true,
+    "sharedCapital": false,
+    "crossAssetTransfers": false,
+    "allocationOwner": "external_logic",
+    "treeResponsibilities": [
+      "read each asset's supplied capital",
+      "size trades only against that asset's own account state"
+    ],
+    "treeMustNot": [
+      "pool balances across assets",
+      "rebalance capital between assets",
+      "infer or allocate capital for an asset"
+    ]
+  },
+  "runtime": {
+    "evaluation": "once_per_closed_4h_candle_per_asset",
+    "closedCandlesOnly": true,
+    "noLookahead": true,
+    "sameTreeForAllAssets": true,
+    "stateIsolationKey": "symbol",
+    "requiredInputs": [
+      "symbol",
+      "closedBar",
+      "features",
+      "capital",
+      "previousState"
+    ],
+    "capital": {
+      "BTCUSDT": null,
+      "ETHUSDT": null,
+      "BNBUSDT": null
+    },
+    "previousState": {
+      "required": true,
+      "source": "external_state_store",
+      "scope": "per_asset",
+      "restoreBeforeEvaluation": true,
+      "persistAfterEvaluation": true,
+      "fields": [
+        "position",
+        "pendingOrder",
+        "cash",
+        "equity",
+        "peakEquity",
+        "drawdownPct",
+        "pauseUntilBar",
+        "cooldownLeft",
+        "consecutiveLosses",
+        "rollingWindowR",
+        "recentTradeR",
+        "degradationState",
+        "lastProcessedBar",
+        "tradeCounters",
+        "rejectionCounters"
+      ],
+      "staleOrMissingStatePolicy": "NO_TRADE_STATE_NOT_READY"
+    }
+  },
+  "enums": {
+    "Strategy": {
+      "NONE": 0,
+      "DONCHIAN_A": 1,
+      "VCEB_C": 2
+    },
+    "ExitReason": {
+      "NONE": 0,
+      "STOP": 1,
+      "HARD_STOP": 2,
+      "TRAIL": 3,
+      "KILL": 4,
+      "TIME": 5,
+      "DRAWDOWN": 6
+    },
+    "Decision": {
+      "NO_TRADE": 0,
+      "HOLD": 1,
+      "ENTER": 2,
+      "EXIT": 3,
+      "TIGHTEN_STOP": 4
+    }
+  },
+  "strategyKeys": {
+    "A": "DONCHIAN_A",
+    "C": "VCEB_C"
+  },
+  "params": {
+    "data": {
+      "warmupBars": 200,
+      "gapCheckBars": 300,
+      "requireFiniteEnabledFeatures": true
+    },
+    "cost": {
+      "feeRatePerSide": 0.001,
+      "slipRatePerSide": 0.0005,
+      "stopSlipMult": 2.5,
+      "roundTripCostModel": "entry_fee + exit_fee + entry_slippage + exit_slippage",
+      "maxCostInR": 0.15,
+      "minTargetCostMultiple": 4.0,
+      "costGateAppliesTo": [
+        "A",
+        "C"
+      ],
+      "costInputsMustBeEstimatedBeforeEntry": true
+    },
+    "indicators": {
+      "emaTrend": 200,
+      "atr": 14,
+      "donchianA": 40,
+      "donchianC": 10,
+      "volumeSma": 20,
+      "bb": 20,
+      "bbStd": 2.0,
+      "compressionLookback": 100,
+      "compressionPercentile": 0.2,
+      "emaRiseLookback": 10
+    },
+    "strategyA": {
+      "enabledByAsset": true,
+      "donchianPeriod": 40,
+      "emaPeriod": 200,
+      "volumeMult": 1.2,
+      "initialStopAtr": 3.0,
+      "trailAtr": 3.0,
+      "trailReference": "highest_close_since_entry",
+      "trailTrigger": "close_below_trailing_stop",
+      "trailExecution": "next_bar_open"
+    },
+    "strategyC": {
+      "name": "VCEB",
+      "description": "Volatility-compression breakout",
+      "enabledByAsset": true,
+      "bbPeriod": 20,
+      "bbStd": 2.0,
+      "compressionLookback": 100,
+      "compressionPercentile": 0.2,
+      "compressionOffset": 0,
+      "emaRiseLookback": 10,
+      "breakoutLookback": 10,
+      "volumeMult": 1.2,
+      "initialStopAtr": 2.0,
+      "trailAtr": 3.0,
+      "trailReference": "highest_high_since_entry",
+      "trailExecution": "resting_intrabar_stop",
+      "qualityCompressionRatio": null,
+      "qualityBreakoutAtr": 0.0,
+      "avoidABreakoutAtr": null
+    },
+    "priority": [
+      "A",
+      "C"
+    ],
+    "risk": {
+      "riskPerTrade": 0.0075,
+      "strategyMultiplier": {
+        "A": 1.0,
+        "C": 0.8
+      },
+      "maxPositionFraction": 1.0,
+      "maxAlloc": 1.0,
+      "globalHardStopAtr": 4.0,
+      "minimumNotional": 10.0,
+      "sizingCapitalField": "assetState.cash",
+      "formula": "notional = min((cash * riskPerTrade * strategyMultiplier * fill / stopDistance), cash * maxPositionFraction, cash)",
+      "rejectIfStopDistanceNonPositive": true,
+      "rejectIfNotionalBelowMinimum": true
+    },
+    "exit": {
+      "A": {
+        "initialStopAtr": 3.0,
+        "trailAtr": 3.0,
+        "trailReference": "highest_close"
+      },
+      "C": {
+        "initialStopAtr": 2.0,
+        "trailAtr": 3.0,
+        "trailReference": "highest_high",
+        "trailIntrabar": true
+      },
+      "hardStopAtr": 4.0,
+      "maxHoldBars": 180
+    },
+    "kill": {
+      "enabled": true,
+      "atrPercentileMin": 0.99,
+      "rNowMin": 0.5,
+      "tightenAtrMult": 1.5
+    },
+    "account": {
+      "drawdownPause": 0.1,
+      "drawdownPauseBars": 42,
+      "rollingLossWindowBars": 42,
+      "rollingRFloor": -3.0,
+      "cooldownBaseBars": 6,
+      "cooldownAfterStopBars": 12,
+      "cooldownMaxBars": 48,
+      "degradation": {
+        "enabled": true,
+        "windowTrades": 12,
+        "minSumR": -6.0,
+        "resumeAfterBars": 180
+      }
+    },
+    "capital": {
+      "initialCapital": "runtime.capital.<symbol>",
+      "perAssetIndependent": true
+    },
+    "gates": {
+      "stopMinAtr": 1.0,
+      "stopMaxAtr": 3.0
+    }
+  },
+  "features": {
+    "market": [
+      "open",
+      "high",
+      "low",
+      "close",
+      "volume",
+      "ema200",
+      "atr14",
+      "donchian40",
+      "volSma20",
+      "bbMid",
+      "bbUpper",
+      "bbLower",
+      "cBbWidth",
+      "cWidthThreshold",
+      "cDonchian10"
+    ],
+    "candidate": {
+      "A": [
+        "signal",
+        "stop",
+        "stopDistance",
+        "stopDistanceAtr",
+        "costInR",
+        "expectedNetR",
+        "targetCostMultiple"
+      ],
+      "C": [
+        "rawSignal",
+        "signalAfterGates",
+        "stop",
+        "stopDistance",
+        "stopDistanceAtr",
+        "costInR",
+        "expectedNetR",
+        "targetCostMultiple",
+        "gateRejected"
+      ]
+    },
+    "account": [
+      "assetState.cash",
+      "assetState.equity",
+      "assetState.peakEquity",
+      "assetState.drawdownPct",
+      "assetState.pauseUntilBar",
+      "assetState.cooldownLeft",
+      "assetState.weekR",
+      "assetState.consecutiveLosses",
+      "assetState.degradationState"
+    ],
+    "position": [
+      "position.exists",
+      "position.strategy",
+      "position.entryFill",
+      "position.qty",
+      "position.stop",
+      "position.hardStop",
+      "position.highestClose",
+      "position.highestHigh",
+      "position.barsHeld",
+      "position.rNow",
+      "position.mfeR",
+      "position.maeR",
+      "position.stopHit",
+      "position.hardStopHit",
+      "position.trailExitSignal",
+      "position.killStop"
+    ],
+    "execution": [
+      "pendingOrder.exists",
+      "pendingOrder.type",
+      "pendingOrder.signalAtr",
+      "pendingOrder.strategy"
+    ]
+  },
+  "root": "r_data",
+  "nodes": [
+    {
+      "id": "r_data",
+      "type": "cond",
+      "left": "dataOk",
+      "op": "eq",
+      "right": 1,
+      "yes": "r_pending",
+      "no": "a_no_data",
+      "note": "closed candle, warm-up, gap and finite-feature checks"
+    },
+    {
+      "id": "r_pending",
+      "type": "cond",
+      "left": "pendingOrder.exists",
+      "op": "eq",
+      "right": 0,
+      "yes": "r_pos",
+      "no": "a_hold_pending"
+    },
+    {
+      "id": "r_pos",
+      "type": "cond",
+      "left": "position.exists",
+      "op": "eq",
+      "right": 1,
+      "yes": "x_stop",
+      "no": "e_pause"
+    },
+    {
+      "id": "x_stop",
+      "type": "cond",
+      "left": "position.stopHit",
+      "op": "eq",
+      "right": 1,
+      "yes": "a_exit_stop",
+      "no": "x_hard_stop",
+      "note": "resting stop check; position management always precedes entry logic"
+    },
+    {
+      "id": "x_hard_stop",
+      "type": "cond",
+      "left": "position.hardStopHit",
+      "op": "eq",
+      "right": 1,
+      "yes": "a_exit_hard_stop",
+      "no": "x_kill_vol"
+    },
+    {
+      "id": "x_kill_vol",
+      "type": "cond",
+      "left": "atrPctPctl",
+      "op": "gt",
+      "right": "@kill.atrPercentileMin",
+      "yes": "x_kill_r",
+      "no": "x_time_cap",
+      "note": "volatility kill switch"
+    },
+    {
+      "id": "x_kill_r",
+      "type": "cond",
+      "left": "position.rNow",
+      "op": "lt",
+      "right": "@kill.rNowMin",
+      "yes": "a_exit_kill",
+      "no": "x_kill_tighten"
+    },
+    {
+      "id": "x_kill_tighten",
+      "type": "cond",
+      "left": "position.killStop",
+      "op": "gt",
+      "right": "position.stop",
+      "yes": "a_tighten_kill",
+      "no": "x_time_cap"
+    },
+    {
+      "id": "x_time_cap",
+      "type": "cond",
+      "left": "position.barsHeld",
+      "op": "gte",
+      "right": "@exit.maxHoldBars",
+      "yes": "a_exit_time",
+      "no": "x_trail"
+    },
+    {
+      "id": "x_trail",
+      "type": "cond",
+      "left": "position.trailExitSignal",
+      "op": "eq",
+      "right": 1,
+      "yes": "a_exit_trail",
+      "no": "a_hold_position",
+      "note": "A close-based trail and C resting trail are represented by position manager signals"
+    },
+    {
+      "id": "e_pause",
+      "type": "cond",
+      "left": "assetState.paused",
+      "op": "eq",
+      "right": 0,
+      "yes": "e_weekly",
+      "no": "a_no_dd_pause"
+    },
+    {
+      "id": "e_weekly",
+      "type": "cond",
+      "left": "assetState.weekR",
+      "op": "gt",
+      "right": "@account.rollingRFloor",
+      "yes": "e_cooldown",
+      "no": "a_no_weekly_cap"
+    },
+    {
+      "id": "e_cooldown",
+      "type": "cond",
+      "left": "assetState.cooldownLeft",
+      "op": "eq",
+      "right": 0,
+      "yes": "e_degrade",
+      "no": "a_no_cooldown"
+    },
+    {
+      "id": "e_degrade",
+      "type": "cond",
+      "left": "assetState.degradationActive",
+      "op": "eq",
+      "right": 0,
+      "yes": "e_signal_a",
+      "no": "a_no_degradation"
+    },
+    {
+      "id": "e_signal_a",
+      "type": "cond",
+      "left": "A.signal",
+      "op": "eq",
+      "right": 1,
+      "yes": "e_a_stop",
+      "no": "e_signal_c"
+    },
+    {
+      "id": "e_a_stop",
+      "type": "cond",
+      "left": "A.stopDistanceAtr",
+      "op": "between",
+      "right": [
+        "@gates.stopMinAtr",
+        "@gates.stopMaxAtr"
+      ],
+      "yes": "e_a_cost",
+      "no": "a_no_entry",
+      "tag": "A:stop_band"
+    },
+    {
+      "id": "e_a_cost",
+      "type": "cond",
+      "left": "A.costInR",
+      "op": "lte",
+      "right": "@cost.maxCostInR",
+      "yes": "e_a_edge",
+      "no": "a_no_entry",
+      "tag": "A:cost_in_r"
+    },
+    {
+      "id": "e_a_edge",
+      "type": "cond",
+      "left": "A.targetCostMultiple",
+      "op": "gte",
+      "right": "@cost.minTargetCostMultiple",
+      "yes": "a_enter_a",
+      "no": "a_no_entry",
+      "tag": "A:min_edge"
+    },
+    {
+      "id": "e_signal_c",
+      "type": "cond",
+      "left": "C.rawSignal",
+      "op": "eq",
+      "right": 1,
+      "yes": "e_c_enabled",
+      "no": "a_no_entry"
+    },
+    {
+      "id": "e_c_enabled",
+      "type": "cond",
+      "left": "C.enabled",
+      "op": "eq",
+      "right": 1,
+      "yes": "e_c_gate_ratio",
+      "no": "a_no_entry",
+      "tag": "C:disabled"
+    },
+    {
+      "id": "e_c_gate_ratio",
+      "type": "cond",
+      "left": "C.compressionRatioPass",
+      "op": "eq",
+      "right": 1,
+      "yes": "e_c_gate_margin",
+      "no": "a_no_entry",
+      "tag": "C:compression_quality",
+      "note": "ETH only when qualityCompressionRatio is set; otherwise pass"
+    },
+    {
+      "id": "e_c_gate_margin",
+      "type": "cond",
+      "left": "C.breakoutMarginPass",
+      "op": "eq",
+      "right": 1,
+      "yes": "e_c_gate_avoid_a",
+      "no": "a_no_entry",
+      "tag": "C:breakout_margin",
+      "note": "ETH only when qualityBreakoutAtr > 0; otherwise pass"
+    },
+    {
+      "id": "e_c_gate_avoid_a",
+      "type": "cond",
+      "left": "C.avoidABreakoutPass",
+      "op": "eq",
+      "right": 1,
+      "yes": "e_c_stop",
+      "no": "a_no_entry",
+      "tag": "C:avoid_A_proximity",
+      "note": "ETH only when avoidABreakoutAtr is set; otherwise pass"
+    },
+    {
+      "id": "e_c_stop",
+      "type": "cond",
+      "left": "C.stopDistanceAtr",
+      "op": "between",
+      "right": [
+        "@gates.stopMinAtr",
+        "@gates.stopMaxAtr"
+      ],
+      "yes": "e_c_cost",
+      "no": "a_no_entry",
+      "tag": "C:stop_band"
+    },
+    {
+      "id": "e_c_cost",
+      "type": "cond",
+      "left": "C.costInR",
+      "op": "lte",
+      "right": "@cost.maxCostInR",
+      "yes": "e_c_edge",
+      "no": "a_no_entry",
+      "tag": "C:cost_in_r"
+    },
+    {
+      "id": "e_c_edge",
+      "type": "cond",
+      "left": "C.targetCostMultiple",
+      "op": "gte",
+      "right": "@cost.minTargetCostMultiple",
+      "yes": "a_enter_c",
+      "no": "a_no_entry",
+      "tag": "C:min_edge"
+    },
+    {
+      "id": "a_no_data",
+      "type": "action",
+      "action": "NO_TRADE",
+      "reason": "data_not_ready"
+    },
+    {
+      "id": "a_hold_pending",
+      "type": "action",
+      "action": "HOLD",
+      "reason": "pending_order"
+    },
+    {
+      "id": "a_hold_position",
+      "type": "action",
+      "action": "HOLD",
+      "reason": "in_position"
+    },
+    {
+      "id": "a_no_dd_pause",
+      "type": "action",
+      "action": "NO_TRADE",
+      "reason": "drawdown_pause"
+    },
+    {
+      "id": "a_no_weekly_cap",
+      "type": "action",
+      "action": "NO_TRADE",
+      "reason": "rolling_loss_cap"
+    },
+    {
+      "id": "a_no_cooldown",
+      "type": "action",
+      "action": "NO_TRADE",
+      "reason": "cooldown"
+    },
+    {
+      "id": "a_no_degradation",
+      "type": "action",
+      "action": "NO_TRADE",
+      "reason": "strategy_degradation_pause"
+    },
+    {
+      "id": "a_no_entry",
+      "type": "action",
+      "action": "NO_TRADE",
+      "reason": "no_eligible_signal"
+    },
+    {
+      "id": "a_enter_a",
+      "type": "action",
+      "action": "QUEUE_ENTRY",
+      "strategy": "A",
+      "stopFrom": "A.stop",
+      "stopAtrMult": "@strategyA.initialStopAtr",
+      "riskMultiplier": "@risk.strategyMultiplier.A",
+      "fill": "next_bar_open"
+    },
+    {
+      "id": "a_enter_c",
+      "type": "action",
+      "action": "QUEUE_ENTRY",
+      "strategy": "C",
+      "stopFrom": "C.stop",
+      "stopAtrMult": "@strategyC.initialStopAtr",
+      "riskMultiplier": "@risk.strategyMultiplier.C",
+      "fill": "next_bar_open"
+    },
+    {
+      "id": "a_exit_stop",
+      "type": "action",
+      "action": "EXIT",
+      "exitReason": "STOP"
+    },
+    {
+      "id": "a_exit_hard_stop",
+      "type": "action",
+      "action": "EXIT",
+      "exitReason": "HARD_STOP"
+    },
+    {
+      "id": "a_exit_kill",
+      "type": "action",
+      "action": "EXIT",
+      "exitReason": "KILL"
+    },
+    {
+      "id": "a_exit_time",
+      "type": "action",
+      "action": "EXIT",
+      "exitReason": "TIME"
+    },
+    {
+      "id": "a_exit_trail",
+      "type": "action",
+      "action": "EXIT",
+      "exitReason": "TRAIL"
+    },
+    {
+      "id": "a_tighten_kill",
+      "type": "action",
+      "action": "TIGHTEN_STOP",
+      "newStopFrom": "position.killStop"
+    }
+  ],
+  "featureDefinitions": {
+    "donchian40": "max(high[i-40..i-1]); current candle excluded (shift 1)",
+    "donchian10": "max(high[i-10..i-1]); current candle excluded (shift 1)",
+    "ema200": "EMA(close, 200), adjust=false, min_periods=200",
+    "atr14": "Wilder ATR(14) using RMA of true range",
+    "volSma20": "SMA(volume, 20), includes current closed candle",
+    "cBbWidth": "(BBUpper - BBLower) / BBMid using BB(20, 2.0)",
+    "cWidthThreshold": "linear-interpolated 20th percentile of cBbWidth over prior 100 bars, shifted by one bar",
+    "A.signal": "A.enabled AND finite(ema200, donchian40, atr14) AND close > ema200 AND close > donchian40 AND (volumeMult is null OR volume > volumeMult * volSma20)",
+    "C.rawSignal": "C.enabled AND cBbWidth < cWidthThreshold AND ema200 > ema200[i-10] AND close > ema200 AND close > donchian10 AND (volumeMult is null OR volume > volumeMult * volSma20)",
+    "C.compressionRatioPass": "true when qualityCompressionRatio is null, otherwise cBbWidth <= qualityCompressionRatio * cWidthThreshold",
+    "C.breakoutMarginPass": "true when qualityBreakoutAtr <= 0, otherwise close >= donchian10 + qualityBreakoutAtr * atr14",
+    "C.avoidABreakoutPass": "true when avoidABreakoutAtr is null OR A disabled OR close <= ema200 OR close < donchian40 - avoidABreakoutAtr * atr14",
+    "candidateCostFields": "Cost feature layer must calculate costInR, expectedNetR and targetCostMultiple from the estimated move/risk and fee+slippage model; if no defensible expected-move estimate exists, fail the cost gate rather than assume an edge."
+  },
+  "execution": {
+    "barOrder": [
+      "restore per-asset previousState",
+      "resolve pending entry/exit orders at this bar open",
+      "manage any open position and resting stops",
+      "evaluate drawdown pause and account-level entry blocks",
+      "evaluate A signal and then C signal on this closed bar",
+      "apply A-over-C priority",
+      "apply cost and eligibility gates",
+      "queue selected entry for next bar open",
+      "mark asset account to market and persist state"
+    ],
+    "entry": {
+      "signalTiming": "closed_bar",
+      "fillTiming": "next_bar_open",
+      "entryFillFormula": "next_open * (1 + slipRatePerSide)",
+      "atrForInitialStop": "frozen from signal bar",
+      "AInitialStop": "entryFill - 3.0 * signalBarATR",
+      "CInitialStop": "entryFill - 2.0 * signalBarATR",
+      "hardStop": "entryFill - 4.0 * signalBarATR",
+      "sizing": "risk-based using this asset's cash only; fee-adjusted quantity",
+      "minimumNotional": 10.0
+    },
+    "positionManagement": {
+      "A": "highestClose = max(highestClose, close); stop = max(stop, highestClose - 3*ATR); if close < stop, queue exit for next open",
+      "C": "highestHigh = max(highestHigh, high); stop = max(stop, highestHigh - 3*ATR); stop is a resting intrabar stop",
+      "stopFill": "if bar opens through stop, use open; otherwise use stop; apply adverse slippage",
+      "hardStopPriority": "hard stop is checked before trailing stop where applicable",
+      "neverLoosenStop": true
+    },
+    "accounting": {
+      "entryFee": "notional * feeRatePerSide",
+      "exitFee": "exitProceeds * feeRatePerSide",
+      "entrySlippage": "buy fill above open by slipRatePerSide",
+      "exitSlippage": "sell fill below exit level by slipRatePerSide",
+      "rMultiple": "net realized PnL / fee-adjusted initial risk cash"
+    }
+  },
+  "stateTransitions": {
+    "onTradeClose": [
+      "update cash, equity, realized PnL and R multiple",
+      "append trade R to per-asset rolling trade history",
+      "update consecutiveLosses and cooldownLeft",
+      "update strategy degradation window and pause/resume state",
+      "update peakEquity and drawdown state"
+    ],
+    "drawdownPause": {
+      "trigger": "equity <= peakEquity * (1 - 0.10)",
+      "durationBars": 42,
+      "effect": "block new entries only; manage open positions normally",
+      "expiry": "clear pause and reset peakEquity to equity at expiry"
+    },
+    "rollingLossCap": {
+      "windowBars": 42,
+      "blockWhen": "assetState.weekR <= -3.0"
+    },
+    "cooldown": {
+      "baseBars": 6,
+      "afterStopBars": 12,
+      "maxBars": 48,
+      "escalateWithConsecutiveLosses": true
+    },
+    "degradation": {
+      "enabled": true,
+      "windowTrades": 12,
+      "pauseWhenSumRAtOrBelow": -6.0,
+      "resumeAfterBars": 180,
+      "perStrategyAndAsset": true
+    }
+  },
+  "diagnostics": {
+    "perAsset": [
+      "signalsA",
+      "signalsC",
+      "executedA",
+      "executedC",
+      "cGateRejections",
+      "sameBarConflicts",
+      "blockedByPause",
+      "blockedByCost",
+      "blockedByCooldown",
+      "trades",
+      "fees",
+      "slippage",
+      "realizedPnl",
+      "equity",
+      "drawdown",
+      "pauseState"
+    ],
+    "priorityRule": "If raw A and raw C signals both fire on the same closed candle, A has strict priority. If A is then rejected by its own stop/cost/edge gate, do not fall through to C on that candle.",
+    "noTradeReasonTags": [
+      "data_not_ready",
+      "pending_order",
+      "drawdown_pause",
+      "rolling_loss_cap",
+      "cooldown",
+      "strategy_degradation_pause",
+      "cost_gate",
+      "stop_band",
+      "no_eligible_signal"
+    ],
+    "sameBarConflictDefinition": "Count when A.signal and C.rawSignal are both true on the same closed candle, before priority and eligibility gates."
+  },
+  "validation": {
+    "required": [
+      "JSON parses with no comments or trailing commas",
+      "all three asset accounts are isolated and capital is never pooled",
+      "BTC has A enabled and C disabled",
+      "ETH has A enabled and C enabled with 0.8 / 0.10 ATR / 1.0 ATR gates",
+      "BNB has A enabled and C enabled with all C gates off",
+      "A wins deterministic same-bar A/C conflicts",
+      "signals use closed candles and shifted Donchian channels",
+      "pending entries fill no earlier than the next bar open",
+      "fees and slippage are included in cost checks and realized PnL",
+      "drawdown pause, rolling loss cap, cooldown, degradation and persisted previous state are enforced per asset"
+    ],
+    "researchReferences": {
+      "BTC_A_only_OOS_PnL_pct": 82.98,
+      "ETH_A_plus_gated_C_OOS_PnL_pct": 81.95,
+      "BNB_A_plus_unrestricted_C_OOS_PnL_pct": 77.89
+    }
+  }
+}
