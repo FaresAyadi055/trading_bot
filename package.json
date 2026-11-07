@@ -1,12 +1,17 @@
 {
   "name": "trading_bot",
   "scripts": {
-    "dev": "bun run --hot src/index.ts"
+    "dev": "bun run --hot src/index.ts",
+    "start": "bun run src/index.ts",
+    "test": "bun test",
+    "smoke": "bun tests/smoke.ts"
   },
   "dependencies": {
-    "hono": "^4.13.16"
+    "hono": "^4.13.16",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "typescript": "^7.0.2"
   }
 }

@@ -1,8 +1,16 @@
 {
   "compilerOptions": {
     "strict": true,
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ESNext"],
     "types": ["bun"],
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "noEmit": true,
     "jsx": "react-jsx",
     "jsxImportSource": "hono/jsx"
-  }
+  },
+  "include": ["src", "tests", "bot"]
 }

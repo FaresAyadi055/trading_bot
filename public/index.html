@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trading bot dashboard</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--fg:#14171f;--mut:#6b7280;--line:#e5e7eb;--acc:#2563eb;--up:#15803d;--dn:#b91c1c;--warn:#b45309}
+@media (prefers-color-scheme:dark){:root{--bg:#0e1116;--card:#171b22;--fg:#e6e8ee;--mut:#8b93a3;--line:#2a303b;--acc:#6ea0ff;--up:#4ade80;--dn:#f87171;--warn:#fbbf24}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,sans-serif}
+header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--line);background:var(--card)}
+h1{font-size:16px;margin:0}main{max-width:1100px;margin:0 auto;padding:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:14px}
+.grid{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
+.k{color:var(--mut);font-size:12px}.v{font-size:18px;font-weight:600}
+.up{color:var(--up)}.dn{color:var(--dn)}.mut{color:var(--mut)}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+button,select,input{font:inherit;color:var(--fg);background:var(--card);border:1px solid var(--line);border-radius:7px;padding:6px 10px}
+button{cursor:pointer}button:hover{border-color:var(--acc)}button.pri{background:var(--acc);border-color:var(--acc);color:#fff}button.danger{color:var(--dn)}
+.badge{display:inline-block;padding:1px 8px;border-radius:99px;font-size:12px;border:1px solid var(--line)}
+.badge.on{color:var(--up);border-color:var(--up)}.badge.off{color:var(--mut)}.badge.wait{color:var(--warn);border-color:var(--warn)}
+table{width:100%;border-collapse:collapse}th,td{text-align:right;padding:5px 8px;border-bottom:1px solid var(--line);white-space:nowrap}th:first-child,td:first-child{text-align:left}
+.scroll{overflow-x:auto}dialog{border:1px solid var(--line);border-radius:12px;background:var(--card);color:var(--fg);max-width:420px;width:92%}
+dialog::backdrop{background:#0008}label{display:block;margin:8px 0 3px;color:var(--mut);font-size:12px}
+.chips label{display:inline-flex;gap:4px;align-items:center;margin:0 10px 0 0;color:var(--fg);font-size:14px}
+svg{width:100%;height:120px;display:block}#login{max-width:380px;margin:12vh auto}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<dialog id="dlg"></dialog>
+<script>
+'use strict';
+const SYMS=['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT'];
+const $=(s)=>document.querySelector(s);
+const esc=(s)=>String(s??'').replace(/[&<>"']/g,(c)=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt=(n,d=2)=>n==null||!isFinite(n)?'–':Number(n).toLocaleString('en-US',{maximumFractionDigits:d,minimumFractionDigits:d});
+const cls=(n)=>n>0?'up':n<0?'dn':'';
+const sgn=(n,d=2)=>(n>0?'+':'')+fmt(n,d);
+let token=localStorage.getItem('tb_token')||'';
+let bots=[],status=null,prices={},open=new Set(),details={};
+const timeAgo=(ms)=>{if(!ms)return 'never';const s=Math.round((Date.now()-ms)/1000);return s<90?s+'s ago':s<5400?Math.round(s/60)+'m ago':Math.round(s/3600)+'h ago'};
+
+async function api(method,path,body){
+  const r=await fetch('/api'+path,{method,headers:{authorization:'Bearer '+token,'content-type':'application/json'},body:body?JSON.stringify(body):undefined});
+  if(r.status===401){localStorage.removeItem('tb_token');token='';render();throw new Error('unauthorized')}
+  const j=await r.json().catch(()=>null);
+  if(!r.ok)throw new Error(j?.error||('HTTP '+r.status));
+  return j;
+}
+// Live prices come straight from Binance (never proxied through the Hono server).
+async function loadPrices(){
+  try{
+    const r=await fetch('https://api.binance.com/api/v3/ticker/price?symbols='+encodeURIComponent(JSON.stringify(SYMS)));
+    for(const x of await r.json())prices[x.symbol]=+x.price;
+  }catch{}
+}
+async function refresh(){
+  if(!token)return;
+  try{
+    [bots,status]=await Promise.all([api('GET','/bots'),api('GET','/status')]);
+    await loadPrices();
+    for(const id of open){details[id]=await api('GET','/bots/'+id+'/transactions?limit=500')}
+    render();
+  }catch(e){if(e.message!=='unauthorized')console.error(e)}
+}
+const mark=(b)=>{ // equity with unrealized P/L marked at the live Binance price
+  const p=b.position;if(!p)return b.cash;
+  return b.cash+p.qty*(prices[p.symbol]??b.lastPrice??p.entryFill);
+};
+function stats(b,txs){
+  const sells=txs.filter(t=>t.action==='SELL').reverse();
+  const wins=sells.filter(t=>t.pnl>0),loss=sells.filter(t=>t.pnl<=0);
+  const gp=wins.reduce((a,t)=>a+t.pnl,0),gl=-loss.reduce((a,t)=>a+t.pnl,0);
+  const curve=[b.initialCapital];let peak=b.initialCapital,mdd=0;
+  for(const t of txs.slice().reverse()){if(t.action==='CAPITAL'||t.action==='SELL'){curve.push(t.cash_after)}}
+  for(const v of curve){peak=Math.max(peak,v);mdd=Math.max(mdd,peak>0?(peak-v)/peak:0)}
+  curve.push(mark(b));
+  return{n:sells.length,win:sells.length?wins.length/sells.length:null,pf:gl>0?gp/gl:(gp>0?Infinity:null),avgR:sells.length?sells.reduce((a,t)=>a+t.r_multiple,0)/sells.length:null,mdd,curve,fees:txs.reduce((a,t)=>a+(t.fee||0),0)};
+}
+function spark(vals){
+  if(vals.length<2)return '<div class="mut">Not enough data for a curve yet.</div>';
+  const w=600,h=120,lo=Math.min(...vals),hi=Math.max(...vals),rg=(hi-lo)||1;
+  const pts=vals.map((v,i)=>(i/(vals.length-1)*w).toFixed(1)+','+(h-6-(v-lo)/rg*(h-12)).toFixed(1)).join(' ');
+  const up=vals[vals.length-1]>=vals[0];
+  return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><polyline fill="none" stroke="${up?'var(--up)':'var(--dn)'}" stroke-width="2" points="${pts}"/></svg>`;
+}
+function botCard(b){
+  const eq=mark(b),pnl=eq-b.initialCapital,pct=pnl/b.initialCapital*100;
+  const p=b.position,u=p?(prices[p.symbol]??b.lastPrice??p.entryFill)*p.qty-p.entryFill*p.qty:0;
+  const pend=b.pendingActions.map(a=>`<span class="badge wait" title="waits for the trade to exit">${esc(a.type.replace('_',' '))} after exit <a href="#" data-act="cancel" data-id="${b.id}" data-type="${a.type}">✕</a></span>`).join(' ');
+  const isOpen=open.has(b.id),txs=details[b.id]||[];
+  let more='';
+  if(isOpen){
+    const s=stats(b,txs);
+    more=`<hr style="border:0;border-top:1px solid var(--line);margin:12px 0">
+    <div class="grid">
+      <div><div class="k">Closed trades</div><div class="v">${s.n}</div></div>
+      <div><div class="k">Win rate</div><div class="v">${s.win==null?'–':fmt(s.win*100,1)+'%'}</div></div>
+      <div><div class="k">Profit factor</div><div class="v">${s.pf==null?'–':s.pf===Infinity?'∞':fmt(s.pf)}</div></div>
+      <div><div class="k">Avg R</div><div class="v">${fmt(s.avgR)}</div></div>
+      <div><div class="k">Max drawdown</div><div class="v dn">${fmt(s.mdd*100,1)}%</div></div>
+      <div><div class="k">Fees paid</div><div class="v">${fmt(s.fees)}</div></div>
+    </div>
+    <div class="k" style="margin-top:12px">Equity curve (USDT, per closed trade, last point marked live)</div>${spark(s.curve)}
+    <div class="k" style="margin:10px 0 4px">Per-asset account state</div>
+    <div class="scroll"><table><tr><th>Asset</th><th>Cooldown</th><th>Paused</th><th>Loss streak</th><th>Drawdown</th><th>Signals A/C</th></tr>
+    ${b.perAsset.map(a=>`<tr><td>${a.symbol}</td><td>${a.cooldownLeft}</td><td>${a.paused?'yes':'no'}</td><td>${a.consecutiveLosses}</td><td>${fmt(a.drawdownPct*100,1)}%</td><td>${a.counters.signalsA||0}/${a.counters.signalsC||0}</td></tr>`).join('')}</table></div>
+    <div class="k" style="margin:10px 0 4px">Transaction log</div>
+    <div class="scroll"><table><tr><th>Time</th><th>Asset</th><th>Side</th><th>Strat</th><th>Price</th><th>Qty</th><th>P/L USDT</th><th>P/L %</th><th>R</th><th>Exit</th><th>Cash</th></tr>
+    ${txs.slice(0,100).map(t=>`<tr><td>${new Date(t.ts).toLocaleString()}</td><td>${esc(t.symbol||'')}</td><td>${t.action}</td><td>${esc(t.strategy||'')}</td><td>${fmt(t.price,4)}</td><td>${fmt(t.qty,6)}</td><td class="${cls(t.pnl)}">${t.pnl==null?'':sgn(t.pnl)}</td><td class="${cls(t.pnl_pct)}">${t.pnl_pct==null?'':sgn(t.pnl_pct)}</td><td>${t.r_multiple==null?'':fmt(t.r_multiple)}</td><td>${esc(t.exit_reason||'')}</td><td>${fmt(t.cash_after)}</td></tr>`).join('')||'<tr><td colspan="11" class="mut">No transactions yet.</td></tr>'}</table></div>`;
+  }
+  return `<div class="card" data-id="${b.id}">
+    <div class="row" style="justify-content:space-between">
+      <div class="row"><strong>${esc(b.name)}</strong><span class="mut">#${b.id}</span>
+        <span class="badge ${b.status==='active'?'on':'off'}">${b.status}</span><span class="badge">${b.mode}</span>
+        ${b.assets.map(a=>`<span class="badge">${a.replace('USDT','')}</span>`).join('')} ${pend}</div>
+      <div class="row">
+        ${b.status==='active'?`<button data-act="deactivate" data-id="${b.id}">Deactivate…</button>`:`<button class="pri" data-act="activate" data-id="${b.id}">Activate</button>`}
+        <button data-act="edit" data-id="${b.id}">Edit</button>
+        <button data-act="download" data-id="${b.id}">JSON</button>
+        <button data-act="toggle" data-id="${b.id}">${isOpen?'Hide':'Analytics'}</button>
+        <button class="danger" data-act="delete" data-id="${b.id}">Delete…</button>
+      </div>
+    </div>
+    <div class="grid" style="margin-top:10px">
+      <div><div class="k">Equity</div><div class="v">${fmt(eq)}</div></div>
+      <div><div class="k">Total P/L</div><div class="v ${cls(pnl)}">${sgn(pnl)} (${sgn(pct)}%)</div></div>
+      <div><div class="k">Cash</div><div class="v">${fmt(b.cash)}</div></div>
+      <div><div class="k">Capital base</div><div class="v">${fmt(b.initialCapital)}</div></div>
+      <div><div class="k">Position</div><div class="v" style="font-size:14px">${p?`${p.symbol} ${p.strategy} · ${fmt(p.qty,6)} @ ${fmt(p.entryFill,4)}<br><span class="${cls(u)}">${sgn(u)} unrealized</span> · stop ${fmt(p.stop,4)}`:b.pendingOrder?`${esc(b.pendingOrder.type)} queued for ${b.pendingOrder.symbol}`:'<span class="mut">flat</span>'}</div></div>
+    </div>${more}</div>`;
+}
+function render(){
+  const el=$('#app');
+  if(!token){
+    el.innerHTML=`<div id="login" class="card"><h1>Trading bot dashboard</h1><label>Access token</label>
+    <input id="tok" type="password" style="width:100%" autofocus><div class="row" style="margin-top:12px"><button class="pri" id="go">Sign in</button><span id="err" class="dn"></span></div></div>`;
+    $('#go').onclick=async()=>{token=$('#tok').value.trim();try{await api('GET','/status');localStorage.setItem('tb_token',token);refresh()}catch(e){token='';$('#err').textContent='Invalid token'}};
+    $('#tok').onkeydown=(e)=>{if(e.key==='Enter')$('#go').click()};
+    return;
+  }
+  const tot=bots.reduce((a,b)=>a+mark(b),0),cap=bots.reduce((a,b)=>a+b.initialCapital,0);
+  el.innerHTML=`<header><h1>Trading bot · live simulation</h1>
+    <div class="row mut"><span>${SYMS.map(s=>`${s.replace('USDT','')} ${fmt(prices[s],s==='BTCUSDT'?0:2)}`).join(' · ')}</span></div>
+    <div class="row"><button class="pri" data-act="create">+ New bot</button><button data-act="logout">Sign out</button></div></header>
+  <main>
+    <div class="card"><div class="row" style="justify-content:space-between"><strong>Profile</strong>
+      <span class="mut">token ••••${esc(token.slice(-4))} · tree ${esc(status?.treeVersion||'')} · schema v${esc(status?.schemaVersion||'')}</span></div>
+      <div class="grid" style="margin-top:8px">
+        <div><div class="k">Bots (active)</div><div class="v">${bots.length} (${bots.filter(b=>b.status==='active').length})</div></div>
+        <div><div class="k">Total equity</div><div class="v">${fmt(tot)}</div></div>
+        <div><div class="k">Total P/L</div><div class="v ${cls(tot-cap)}">${sgn(tot-cap)}</div></div>
+        <div><div class="k">Next 4h candle</div><div class="v" style="font-size:14px">${status?new Date(status.nextBarAt).toLocaleTimeString():'–'}</div></div>
+        <div><div class="k">Last data cycle</div><div class="v" style="font-size:14px">${timeAgo(status?.workerLastCycle)}</div></div>
+        <div><div class="k">Telegram</div><div class="v" style="font-size:14px">${status?.telegram?'on':'off'}</div></div>
+      </div>${status?.workerError?`<div class="dn" style="margin-top:8px;font-size:12px">Last data error: ${esc(status.workerError)}</div>`:''}
+    </div>
+    ${bots.map(botCard).join('')||'<div class="card mut">No bots yet. Create one to start the simulation.</div>'}
+  </main>`;
+}
+const dlg=$('#dlg');
+const assetBoxes=(sel=[])=>`<div class="chips">${SYMS.map(s=>`<label><input type="checkbox" name="a" value="${s}" ${sel.includes(s)?'checked':''}> ${s.replace('USDT','')}</label>`).join('')}</div>`;
+const picked=()=>[...dlg.querySelectorAll('input[name=a]:checked')].map(i=>i.value);
+function modal(html,onOk,okText='Save'){
+  dlg.innerHTML=`<form method="dialog">${html}<div class="row" style="margin-top:16px;justify-content:flex-end"><button value="x">Cancel</button><button class="pri" id="ok" value="y">${okText}</button></div><div id="merr" class="dn" style="margin-top:8px"></div></form>`;
+  dlg.showModal();
+  dlg.querySelector('#ok').onclick=async(e)=>{e.preventDefault();try{await onOk();dlg.close();refresh()}catch(x){dlg.querySelector('#merr').textContent=x.message}};
+}
+async function download(id){
+  const r=await fetch('/api/bots/'+id+'/export',{headers:{authorization:'Bearer '+token}});
+  const url=URL.createObjectURL(await r.blob());const a=document.createElement('a');a.href=url;a.download='bot-'+id+'.json';a.click();URL.revokeObjectURL(url);
+}
+document.addEventListener('click',async(e)=>{
+  const t=e.target.closest('[data-act]');if(!t)return;e.preventDefault();
+  const {act,id,type}=t.dataset,b=bots.find(x=>x.id===id);
+  try{
+    if(act==='logout'){localStorage.removeItem('tb_token');token='';render()}
+    else if(act==='create')modal(`<h3 style="margin-top:0">New bot</h3><label>Name (optional)</label><input id="n" style="width:100%"><label>Trading assets (one trade at a time)</label>${assetBoxes(['BTCUSDT'])}<label>Capital (USDT)</label><input id="c" type="number" min="1" value="1000" style="width:100%">`,
+      ()=>api('POST','/bots',{name:dlg.querySelector('#n').value||undefined,assets:picked(),capital:+dlg.querySelector('#c').value}),'Create');
+    else if(act==='activate'){await api('POST','/bots/'+id+'/activate');refresh()}
+    else if(act==='deactivate')modal(`<h3 style="margin-top:0">Deactivate ${esc(b.name)}</h3><label>When</label><select id="w" style="width:100%"><option value="after_exit">After the current trade exits${b.position?'':' (flat → immediate)'}</option><option value="now">Now (closes any open position at market)</option></select>`,
+      ()=>api('POST','/bots/'+id+'/deactivate',{when:dlg.querySelector('#w').value}),'Deactivate');
+    else if(act==='edit')modal(`<h3 style="margin-top:0">Edit ${esc(b.name)}</h3><label>Name</label><input id="n" value="${esc(b.name)}" style="width:100%"><label>Trading assets</label>${assetBoxes(b.assets)}<label>If the open trade's asset is removed</label><select id="w" style="width:100%"><option value="after_exit">Wait for the trade to exit</option><option value="now">Close it now</option></select><label>Capital base (USDT) — applied when flat</label><input id="c" type="number" min="1" value="${b.initialCapital}" style="width:100%">`,
+      ()=>{const body={name:dlg.querySelector('#n').value,when:dlg.querySelector('#w').value};const a=picked();if(a.join()!==b.assets.join())body.assets=a;const c=+dlg.querySelector('#c').value;if(c!==b.initialCapital)body.capital=c;return api('PATCH','/bots/'+id,body)});
+    else if(act==='delete')modal(`<h3 style="margin-top:0">Delete ${esc(b.name)}?</h3><p class="mut">All of its data (portfolio, logs, state) is removed permanently.</p><label>When</label><select id="w" style="width:100%"><option value="after_exit">After the current trade exits</option><option value="now">Now</option></select>`,
+      ()=>api('DELETE','/bots/'+id+'?when='+dlg.querySelector('#w').value),'Delete');
+    else if(act==='download')download(id);
+    else if(act==='toggle'){open.has(id)?open.delete(id):open.add(id);refresh()}
+    else if(act==='cancel'){await api('DELETE','/bots/'+id+'/pending/'+type);refresh()}
+  }catch(x){alert(x.message)}
+});
+render();refresh();setInterval(refresh,15000);
+</script>
+</body>
+</html>

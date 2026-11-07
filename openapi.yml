@@ -1,0 +1,227 @@
+openapi: 3.0.3
+info:
+  title: Trading bot API
+  version: 1.0.0
+  description: |
+    Binance spot live-simulation bot manager (4h candles, REST only).
+    All `/api/*` endpoints require `Authorization: Bearer <ACCESS_TOKEN>` (or `x-access-token`).
+    Actions that must not interrupt a trade accept `when=after_exit` (default): they are stored in the
+    bot's `pendingActions` and applied as soon as the bot is flat. `when=now` closes any open
+    position at market (exit reason `MANUAL`) and applies the action immediately.
+servers:
+  - url: http://localhost:3000
+security:
+  - bearer: []
+components:
+  securitySchemes:
+    bearer: { type: http, scheme: bearer }
+  schemas:
+    Symbol: { type: string, enum: [BTCUSDT, ETHUSDT, BNBUSDT, SOLUSDT] }
+    When: { type: string, enum: [now, after_exit], default: after_exit }
+    Error:
+      type: object
+      properties: { error: { type: string }, issues: { type: array, items: { type: object } } }
+    PendingAction:
+      type: object
+      required: [type, requestedAt]
+      properties:
+        type: { type: string, enum: [deactivate, delete, edit_assets, set_capital] }
+        assets: { type: array, items: { $ref: '#/components/schemas/Symbol' } }
+        capital: { type: number }
+        requestedAt: { type: integer }
+    Position:
+      type: object
+      properties:
+        symbol: { type: string }
+        strategy: { type: string, enum: [A, C] }
+        entryFill: { type: number }
+        qty: { type: number }
+        stop: { type: number }
+        hardStop: { type: number }
+        barsHeld: { type: integer }
+    Bot:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        mode: { type: string, enum: [single, multi] }
+        assets: { type: array, items: { $ref: '#/components/schemas/Symbol' } }
+        status: { type: string, enum: [active, inactive] }
+        initialCapital: { type: number, description: USDT capital base }
+        cash: { type: number }
+        equity: { type: number, description: cash + open position marked at the last stored close }
+        lastPrice: { type: number, nullable: true }
+        realizedPnl: { type: number }
+        closedTrades: { type: integer }
+        position: { allOf: [{ $ref: '#/components/schemas/Position' }], nullable: true }
+        pendingOrder: { type: object, nullable: true }
+        pendingActions: { type: array, items: { $ref: '#/components/schemas/PendingAction' } }
+        perAsset: { type: array, items: { type: object } }
+        createdAt: { type: integer }
+        updatedAt: { type: integer }
+    Transaction:
+      type: object
+      properties:
+        id: { type: integer }
+        bot_id: { type: string }
+        ts: { type: integer }
+        bar_time: { type: integer, nullable: true }
+        symbol: { type: string, nullable: true }
+        action: { type: string, enum: [BUY, SELL, CAPITAL] }
+        strategy: { type: string, nullable: true }
+        price: { type: number, nullable: true }
+        qty: { type: number, nullable: true }
+        notional: { type: number, nullable: true }
+        fee: { type: number, nullable: true }
+        pnl: { type: number, nullable: true }
+        pnl_pct: { type: number, nullable: true }
+        r_multiple: { type: number, nullable: true }
+        exit_reason: { type: string, nullable: true, description: STOP, HARD_STOP, KILL, TIME, TRAIL or MANUAL }
+        cash_after: { type: number }
+  responses:
+    Unauthorized: { description: Missing or invalid token, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    NotFound: { description: Bot not found, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Invalid: { description: Validation failed, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+paths:
+  /:
+    get:
+      summary: Redirects to /bot
+      security: []
+      responses: { '302': { description: Redirect } }
+  /bot:
+    get:
+      summary: Frontend root (static HTML, client-side rendered; asks for the access token)
+      security: []
+      responses: { '200': { description: HTML page, content: { text/html: {} } } }
+  /bot/dashboard:
+    get:
+      summary: Dashboard route (same page as /bot)
+      security: []
+      responses: { '200': { description: HTML page, content: { text/html: {} } } }
+  /health:
+    get:
+      summary: Liveness probe
+      security: []
+      responses: { '200': { description: OK } }
+  /api/status:
+    get:
+      summary: Service status (worker heartbeat, candle windows, schema/tree versions)
+      responses:
+        '200':
+          description: Status
+          content: { application/json: { schema: { type: object } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/market:
+    get:
+      summary: Latest computed market features per symbol (one overwritten row per symbol)
+      responses:
+        '200': { description: Features, content: { application/json: { schema: { type: array, items: { type: object } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/bots:
+    get:
+      summary: List bot instances
+      responses:
+        '200': { description: Bots, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Bot' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      summary: Create a bot (live from the next closed 4h candle)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [assets, capital]
+              properties:
+                name: { type: string, maxLength: 60 }
+                assets: { type: array, minItems: 1, uniqueItems: true, items: { $ref: '#/components/schemas/Symbol' } }
+                capital: { type: number, exclusiveMinimum: 0, description: USDT }
+                active: { type: boolean, default: true }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Bot' } } } }
+        '400': { $ref: '#/components/responses/Invalid' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/bots/{id}:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+    get:
+      summary: Bot details
+      responses:
+        '200': { description: Bot, content: { application/json: { schema: { $ref: '#/components/schemas/Bot' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      summary: Rename, edit trading assets and/or update USDT capital
+      description: |
+        Asset edits that drop the asset of an open trade wait for the exit (`when=after_exit`) or close
+        it immediately (`when=now`). Capital changes are never applied mid-trade; they are scheduled and
+        applied when the bot is flat (cash is adjusted by the difference to the previous capital base).
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                assets: { type: array, items: { $ref: '#/components/schemas/Symbol' } }
+                capital: { type: number }
+                when: { $ref: '#/components/schemas/When' }
+      responses:
+        '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/Bot' } } } }
+        '400': { $ref: '#/components/responses/Invalid' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      summary: Delete a bot and its whole footprint (state, transactions, events)
+      parameters: [{ name: when, in: query, schema: { $ref: '#/components/schemas/When' } }]
+      responses:
+        '200': { description: Deleted now }
+        '202': { description: Scheduled; will be deleted when the open trade exits }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/bots/{id}/activate:
+    post:
+      summary: Activate / reactivate (also cancels a scheduled deactivation)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: Bot, content: { application/json: { schema: { $ref: '#/components/schemas/Bot' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/bots/{id}/deactivate:
+    post:
+      summary: Deactivate now (closes open position) or after the current trade exits
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        content: { application/json: { schema: { type: object, properties: { when: { $ref: '#/components/schemas/When' } } } } }
+      responses:
+        '200': { description: Bot, content: { application/json: { schema: { $ref: '#/components/schemas/Bot' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: No market price available to close at, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /api/bots/{id}/pending/{type}:
+    delete:
+      summary: Cancel a scheduled action
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: type, in: path, required: true, schema: { type: string, enum: [deactivate, delete, edit_assets, set_capital] } }
+      responses:
+        '200': { description: Bot, content: { application/json: { schema: { $ref: '#/components/schemas/Bot' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/bots/{id}/transactions:
+    get:
+      summary: Transaction log, newest first
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 200, maximum: 1000 } }
+        - { name: before, in: query, description: Return rows with id lower than this, schema: { type: integer } }
+      responses:
+        '200': { description: Rows, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Transaction' } } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/bots/{id}/events:
+    get:
+      summary: Lifecycle and rejection events (newest 200)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: Events, content: { application/json: { schema: { type: array, items: { type: object } } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/bots/{id}/export:
+    get:
+      summary: Download all bot data as JSON (profile, asset states, transactions, events)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: JSON attachment, content: { application/json: { schema: { type: object } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
