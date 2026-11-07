@@ -1,8 +1,8 @@
 {
   "schema": "decision-tree/v2",
   "name": "asset-aware-donchian-vceb-4h-spot",
-  "treeVersion": "v1.0",
-  "description": "Asset-aware long-only spot decision engine for BTC, ETH and BNB. Strategy A (Donchian) is primary; Strategy C (VCEB volatility-compression breakout) is secondary and configured per asset.",
+  "treeVersion": "v1.2",
+  "description": "Asset-aware long-only spot decision engine for BTC, ETH, BNB and SOL. Strategy A (Donchian) is primary; Strategy C (VCEB volatility-compression breakout) is secondary and configured per asset. v1.1 adds the ETH-only Kaufman persistence gate on A (ER-20 >= 0.30); v1.2 adds SOLUSDT with the BNB asset mode (A + unrestricted C, research/tentative status).",
   "market": {
     "venue": "Binance spot",
     "quoteAsset": "USDT",
@@ -30,7 +30,8 @@
       "capitalInput": "runtime.capital.ETHUSDT",
       "strategies": {
         "A": {
-          "enabled": true
+          "enabled": true,
+          "persistenceErMin": 0.3
         },
         "C": {
           "enabled": true,
@@ -58,6 +59,23 @@
         }
       },
       "notes": "Research configuration: A primary plus unrestricted C."
+    },
+    "SOLUSDT": {
+      "enabled": true,
+      "capitalInput": "runtime.capital.SOLUSDT",
+      "strategies": {
+        "A": {
+          "enabled": true
+        },
+        "C": {
+          "enabled": true,
+          "mode": "unrestricted",
+          "qualityCompressionRatio": null,
+          "qualityBreakoutAtr": 0.0,
+          "avoidABreakoutAtr": null
+        }
+      },
+      "notes": "Research configuration: identical to BNB mode (A + unrestricted C); tentative — 4.5y spot history, no dev-period validation."
     }
   },
   "capitalModel": {
@@ -94,7 +112,8 @@
     "capital": {
       "BTCUSDT": null,
       "ETHUSDT": null,
-      "BNBUSDT": null
+      "BNBUSDT": null,
+      "SOLUSDT": null
     },
     "previousState": {
       "required": true,
@@ -169,16 +188,16 @@
       "costInputsMustBeEstimatedBeforeEntry": true
     },
     "indicators": {
-      "emaTrend": 200,
       "atr": 14,
-      "donchianA": 40,
-      "donchianC": 10,
-      "volumeSma": 20,
       "bb": 20,
       "bbStd": 2.0,
       "compressionLookback": 100,
       "compressionPercentile": 0.2,
-      "emaRiseLookback": 10
+      "donchianA": 40,
+      "donchianC": 10,
+      "emaRiseLookback": 10,
+      "emaTrend": 200,
+      "persistenceErWindow": 20
     },
     "strategyA": {
       "enabledByAsset": true,
@@ -301,7 +320,9 @@
         "stopDistanceAtr",
         "costInR",
         "expectedNetR",
-        "targetCostMultiple"
+        "targetCostMultiple",
+        "persistenceEr",
+        "persistencePass"
       ],
       "C": [
         "rawSignal",
@@ -489,8 +510,26 @@
       "left": "A.signal",
       "op": "eq",
       "right": 1,
-      "yes": "e_a_stop",
+      "yes": "e_a_er",
       "no": "e_signal_c"
+    },
+    {
+      "id": "e_a_er",
+      "type": "cond",
+      "left": "A.persistencePass",
+      "op": "eq",
+      "right": 1,
+      "yes": "e_a_stop",
+      "no": "a_no_persistence",
+      "tag": "A:persistence",
+      "description": "ETH-only persistence gate (params.indicators.persistenceErWindow, assets.ETHUSDT.strategies.A.persistenceErMin): A entry requires the Kaufman efficiency ratio of the last 20 closed bars >= 0.30. When disabled for an asset the runtime supplies persistencePass = 1. Fail-closed: a non-finite ER blocks A (no C fallback on gated bars)."
+    },
+    {
+      "id": "a_no_persistence",
+      "type": "action",
+      "action": "NO_TRADE",
+      "reason": "A_persistence_blocked",
+      "description": "A signal filtered by the persistence gate; strict priority keeps strategy C from re-entering on the same candle."
     },
     {
       "id": "e_a_stop",
@@ -728,7 +767,9 @@
     "C.compressionRatioPass": "true when qualityCompressionRatio is null, otherwise cBbWidth <= qualityCompressionRatio * cWidthThreshold",
     "C.breakoutMarginPass": "true when qualityBreakoutAtr <= 0, otherwise close >= donchian10 + qualityBreakoutAtr * atr14",
     "C.avoidABreakoutPass": "true when avoidABreakoutAtr is null OR A disabled OR close <= ema200 OR close < donchian40 - avoidABreakoutAtr * atr14",
-    "candidateCostFields": "Cost feature layer must calculate costInR, expectedNetR and targetCostMultiple from the estimated move/risk and fee+slippage model; if no defensible expected-move estimate exists, fail the cost gate rather than assume an edge."
+    "candidateCostFields": "Cost feature layer must calculate costInR, expectedNetR and targetCostMultiple from the estimated move/risk and fee+slippage model; if no defensible expected-move estimate exists, fail the cost gate rather than assume an edge.",
+    "A.persistenceEr": "Kaufman efficiency ratio over the last persistenceErWindow closed bars: |close[i] - close[i-window]| / sum(|close[j] - close[j-1]|) for the same window; NaN during warm-up or if any close in the window is non-finite",
+    "A.persistencePass": "1 if persistenceErMin is null (gate off) or A.persistenceEr >= persistenceErMin; 0 otherwise (fail-closed: non-finite ER -> 0)"
   },
   "execution": {
     "barOrder": [
@@ -836,10 +877,12 @@
   "validation": {
     "required": [
       "JSON parses with no comments or trailing commas",
-      "all three asset accounts are isolated and capital is never pooled",
+      "all four asset accounts are isolated and capital is never pooled",
       "BTC has A enabled and C disabled",
       "ETH has A enabled and C enabled with 0.8 / 0.10 ATR / 1.0 ATR gates",
       "BNB has A enabled and C enabled with all C gates off",
+      "SOL has A enabled and C enabled with all C gates off (identical to the BNB mode; research/tentative status — no 2018-19 dev-period validation individually)",
+      "ETH-only persistence gate: A.persistencePass = 1 required after the A signal (ER-20 >= 0.30, fail-closed); BTC and BNB are ungated",
       "A wins deterministic same-bar A/C conflicts",
       "signals use closed candles and shifted Donchian channels",
       "pending entries fill no earlier than the next bar open",
@@ -849,7 +892,9 @@
     "researchReferences": {
       "BTC_A_only_OOS_PnL_pct": 82.98,
       "ETH_A_plus_gated_C_OOS_PnL_pct": 81.95,
-      "BNB_A_plus_unrestricted_C_OOS_PnL_pct": 77.89
+      "BNB_A_plus_unrestricted_C_OOS_PnL_pct": 77.89,
+      "ETH_ER_gated_OOS_PnL_pct": 85.54,
+      "SOL_BNB_mode_OOS_PnL_pct": 42.96
     }
   }
 }

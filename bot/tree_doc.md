@@ -3,20 +3,21 @@
 **Document:** `doc.md`  
 **Decision-tree file:** `decision_tree_v1.json`  
 **Schema:** `decision-tree/v2`  
-**Tree version:** `v1.0`  
+**Tree version:**a `v1.2`  
 **Market:** Binance Spot, USDT quote, 4-hour candles, long-only, no leverage
 
 ---
 
 ## 1. Purpose and scope
 
-This document describes the JSON-based decision engine for three independently managed spot assets:
+This document describes the JSON-based decision engine for four independently managed spot assets:
 
 - **BTCUSDT:** Strategy A (Donchian) only.
-- **ETHUSDT:** Strategy A primary, Strategy C (VCEB) secondary with quality gates.
+- **ETHUSDT:** Strategy A primary, Strategy C (VCEB) secondary with quality gates and the v1.1 persistence gate on A.
 - **BNBUSDT:** Strategy A primary, Strategy C secondary without the optional quality gates.
+- **SOLUSDT (v1.2):** identical to the BNBUSDT mode, added in research/tentative status.
 
-The same decision tree is interpreted for all three symbols. The effective strategy configuration, capital, account state, positions, orders, counters, and risk controls remain isolated by symbol.
+The same decision tree is interpreted for all four symbols. The effective strategy configuration, capital, account state, positions, orders, counters, and risk controls remain isolated by symbol.
 
 The tree evaluates only completed 4-hour candles. It does not use future candles or future fills.
 
@@ -42,6 +43,7 @@ The decision tree must not pool balances, allocate capital, rebalance between sy
 | BTCUSDT | Enabled | Disabled | Disabled |
 | ETHUSDT | Enabled | Enabled | Gated |
 | BNBUSDT | Enabled | Enabled | Unrestricted |
+| SOLUSDT (v1.2) | Enabled | Enabled | Unrestricted |
 
 ### 2.1 BTCUSDT
 
@@ -68,6 +70,13 @@ The decision tree must not pool balances, allocate capital, rebalance between sy
 
 “Unrestricted” means the three optional C quality gates are inactive. It does **not** disable the shared stop-distance, cost, expected-edge, account-risk, or execution checks.
 
+### 2.4 SOLUSDT (v1.2)
+
+- A: enabled.
+- C: enabled, unrestricted (all three quality gates off) — byte-identical mode to BNBUSDT.
+- Added in research/tentative status: SOL Binance spot history starts 2020-08-11, so the 2018–2019 dev period and the 2020 fold's first months are unavailable (6 clean OOS folds, 2021–2026, vs 7 for the other assets).
+- Provenance (one tree, three modes, config substituted without JSON changes — `scripts/sol_config_mode_test.py`): OOS 2021–26 chained +42.96%, 5/6 folds positive, worst clean fold −0.29%, max-year share ≈ 41%, full period +42.08% (max DD −3.79%), 2026 +4.79%. Checked against the same acceptance battery; **tentative pass** — forward paper validation before it counts as final.
+
 ---
 
 ## 3. Capital and account isolation
@@ -79,6 +88,7 @@ Capital is an external runtime input, not a value allocated by this decision tre
 | BTCUSDT | `runtime.capital.BTCUSDT` |
 | ETHUSDT | `runtime.capital.ETHUSDT` |
 | BNBUSDT | `runtime.capital.BNBUSDT` |
+| SOLUSDT | `runtime.capital.SOLUSDT` |
 
 Requirements:
 
@@ -130,11 +140,14 @@ r_data
                              └─ cooldown
                                  └─ degradation pause
                                      └─ Strategy A signal and gates
-                                         ├─ accepted ─> QUEUE_ENTRY A
-                                         └─ not selected
-                                             └─ Strategy C signal and gates
-                                                 ├─ accepted ─> QUEUE_ENTRY C
-                                                 └─ rejected ─> NO_TRADE
+                                         └─ persistence gate (v1.1, ETH only)
+                                             ├─ ER below threshold ──> NO_TRADE (A:persistence)
+                                             └─ pass
+                                                 ├─ accepted ─> QUEUE_ENTRY A
+                                                 └─ not selected
+                                                     └─ Strategy C signal and gates
+                                                         ├─ accepted ─> QUEUE_ENTRY C
+                                                         └─ rejected ─> NO_TRADE
 ```
 
 The JSON node IDs are the authoritative executable structure. This diagram is a readable summary of their intended path.
@@ -173,7 +186,7 @@ The runtime supplies a structured input for the current asset and closed candle.
 
 | Input | Meaning |
 |---|---|
-| `symbol` | Asset being evaluated: BTCUSDT, ETHUSDT, or BNBUSDT |
+| `symbol` | Asset being evaluated: BTCUSDT, ETHUSDT, BNBUSDT, or SOLUSDT |
 | `closedBar` | Completed 4-hour candle |
 | `features` | Calculated market, candidate, account, position, and execution features |
 | `capital` | External capital supplied for this asset |
@@ -219,6 +232,8 @@ The runtime or feature layer provides candidate-specific values.
 - `A.costInR`
 - `A.expectedNetR`
 - `A.targetCostMultiple`
+- `A.persistenceEr` (v1.1)
+- `A.persistencePass` (v1.1)
 
 **Strategy C**
 
@@ -297,7 +312,7 @@ The tree also references:
 
 ### 6.1 Strategy A — Donchian breakout (primary)
 
-A is enabled for all three assets.
+A is enabled for all assets.
 
 A raw signal is true when all of the following hold:
 
@@ -309,6 +324,7 @@ A raw signal is true when all of the following hold:
 
 A candidate must also pass the shared entry eligibility checks:
 
+- Persistence gate (v1.1, ETH only): `A.persistencePass == 1` — see §6.5.
 - Stop distance is between `1.0` and `3.0 ATR`.
 - `costInR <= 0.15`.
 - `targetCostMultiple >= 4.0`.
@@ -388,9 +404,44 @@ ETH uses `1.0 ATR`; BNB has this gate off.
 
 A has strict priority over C.
 
-If both raw signals are true on the same closed candle, A is selected. The conflict is counted for diagnostics. The engine must not fall through to C on that candle if A is later rejected by its own stop-distance, cost, or edge gate.
+If both raw signals are true on the same closed candle, A is selected. The conflict is counted for diagnostics. The engine must not fall through to C on that candle if A is later rejected by its own stop-distance, cost, edge, or persistence gate.
 
 The conflict counter is defined from the raw A and C signals before priority and eligibility gates. The runtime should calculate this diagnostic independently of the selected path through the decision nodes.
+
+### 6.5 A persistence gate (v1.1, ETH only)
+
+Strategy A entries are additionally filtered by a Kaufman **efficiency-ratio persistence gate**, added in tree v1.1. It keeps A out of zero-persistence chop regimes where breakouts pay taxes.
+
+**Feature (declared, not tuned):**
+
+- Window: `params.indicators.persistenceErWindow = 20` closed 4-hour bars.
+- `A.persistenceEr = |close[i] - close[i-20]| / Σ |close[j] - close[j-1]|` over the same 20-bar window.
+- ER is near 0 in whipsaw chop and near 1 in clean trends. It is `NaN` before the window fills or if any close in the window is non-finite.
+
+**Pass flag (fail-closed):**
+
+- `A.persistencePass = 1` when the asset's threshold is `null` (gate off) or `A.persistenceEr >= persistenceErMin`.
+- Otherwise `0`, including every non-finite ER value. A `NaN` ER **blocks** the entry.
+
+**Configuration (per asset, tree node `e_a_er`):**
+
+| Asset | `persistenceErMin` | Effect |
+|---|---:|---|
+| BTCUSDT | — (absent) | Gate off; BTC keeps its base A profile (2026 damage there is not chop-filterable) |
+| ETHUSDT | `0.3` | A entry requires `A.persistenceEr >= 0.3` after the A signal |
+| BNBUSDT | — (absent) | Gate off; the tested thresholds were year-concentration-failing and fragile |
+| SOLUSDT | — (absent) | Gate off; the ETH 0.30 threshold ported to SOL-mode testing hurt 2024 (blocked A winners), so the gate stays ETH-specific |
+
+**Tree semantics:** node `e_signal_a` (A.signal == 1) routes to `e_a_er` before the stop-band/cost/edge checks. `A.persistencePass == 0` routes to `a_no_persistence` (`NO_TRADE`, reason `A_persistence_blocked`). Strict priority holds: no C fallback on gated candles.
+
+**Provenance — persistence-gate experiment (`scripts/persistence_gate_test.py`, 2026-11):** declared thresholds 0.10/0.20/0.30, identical engine for all variants. Chosen from the OOS checklist:
+
+| ETH config | OOS chained 2020–2026 | Positive folds | Worst fold | Max-year share | Full 2017–26 |
+|---|---:|---|---:|---:|---:|
+| Base (no gate) | +69.34% | 5/7 | −0.56% | 37% | +84.37% |
+| **ER-20 ≥ 0.30 (adopted)** | **+85.54%** | **7/7** | **+1.56%** | **32%** | **+95.47%** |
+
+A-trade count ETH OOS: 113 → 92; C trades essentially unchanged. Status: **tentative pass** — promoted into the tree, still requires a second validation period / forward paper test before being treated as final. Note that the as-built tree is slightly stricter than the experiment overlay: in the experiment the gate masked `a_signal`, letting C fall through to execute on gated bars; in this tree a gated A-candle is `NO_TRADE` with no C fallback, so executed-round results can differ modestly from +85.54%.
 
 ---
 
@@ -649,6 +700,7 @@ The JSON enum also reserves `NONE` and `DRAWDOWN`; the current action nodes do n
 - `cost_gate`
 - `stop_band`
 - `no_eligible_signal`
+- `A_persistence_blocked` (v1.1, ETH persistence gate)
 
 ---
 
@@ -708,12 +760,12 @@ The execution layer is responsible for reporting actual fills and accounting upd
 
 ## 14. Important implementation notes
 
-1. **One tree, three isolated accounts.** Do not share positions, pending orders, cash, equity, drawdown, pauses, cooldowns, or degradation state between symbols.
+1. **One tree, four isolated accounts.** Do not share positions, pending orders, cash, equity, drawdown, pauses, cooldowns, or degradation state between symbols.
 2. **External capital input.** The tree reads capital; it does not allocate capital.
 3. **Closed candles only.** Signals must be based on completed 4-hour candles.
 4. **No lookahead.** Donchian channels and compression thresholds use prior observations as specified.
-5. **A priority is strict.** If A and C both signal, A wins. A failing its later eligibility checks must not cause a same-candle C fallback.
-6. **Cost gates apply to both strategies.** BNB's unrestricted C mode only disables C's three optional quality gates.
+5. **A priority is strict.** If A and C both signal, A wins. A failing its later eligibility checks (stop-distance, cost, edge, or the v1.1 persistence gate) must not cause a same-candle C fallback.
+6. **Cost gates apply to both strategies.** BNB's and SOL's unrestricted C mode only disables C's three optional quality gates.
 7. **State is mandatory.** Missing or stale state must fail closed with `NO_TRADE_STATE_NOT_READY`.
 8. **Queue is not fill.** `QUEUE_ENTRY` must be executed no earlier than the next bar open.
 9. **Diagnostics are observational.** Counters and logs do not change strategy decisions.
@@ -729,12 +781,15 @@ Before running a simulation or live paper account, verify:
 - [ ] BTC has A enabled and C disabled.
 - [ ] ETH has A enabled and C enabled with gates `0.8`, `0.10 ATR`, and `1.0 ATR`.
 - [ ] BNB has A enabled and C enabled with optional C gates off.
+- [ ] SOL (v1.2) mirrors the BNB mode (A enabled, C unrestricted) and is marked research/tentative.
 - [ ] Each asset receives a positive, independent runtime capital input.
 - [ ] No capital pooling or cross-asset transfers occur.
 - [ ] Previous state is restored before evaluation and persisted afterward.
 - [ ] Missing/stale state results in `NO_TRADE_STATE_NOT_READY`.
 - [ ] Signals use closed candles and shifted Donchian channels.
 - [ ] A wins same-bar A/C conflicts without fallback to C.
+- [ ] ETH persistence gate active: `A.persistencePass == A.persistenceEr >= 0.3` on signal candles; BTC/BNB ungated (`persistencePass == 1`).
+- [ ] Non-finite `A.persistenceEr` blocks A entries (fail-closed), even while `A.signal == 1`.
 - [ ] Pending entries fill no earlier than the next bar open.
 - [ ] Cost estimates include fees and slippage.
 - [ ] Stop-distance and target/cost gates are enforced for A and C.
@@ -754,8 +809,10 @@ The JSON records the following out-of-sample reference PnL figures:
 | BTC — A only | +82.98% |
 | ETH — A + gated C | +81.95% |
 | BNB — A + unrestricted C | +77.89% |
+| SOL — BNB mode (v1.2, folds 2021–26) | +42.96% |
+| ETH — A (ER-20 ≥ 0.30) + gated C (v1.1, engine overlay) | +85.54% |
 
-These are research reference values recorded in the configuration, not a promise of future performance or a live result.
+These are research reference values recorded in the configuration, not a promise of future performance or a live result. The v1.1 row is the experimented overlay figure; as-built tree numbers can differ slightly because the tree is stricter (no C fallback on persistence-gated candles). The v1.2 SOL reference spans 6 clean OOS folds (2021–2026; Binance spot history starts 2020-08, so the 2018–2019 dev period is unavailable) — treat it as one step weaker than the 7-fold references.
 
 ---
 
@@ -763,7 +820,7 @@ These are research reference values recorded in the configuration, not a promise
 
 `decision_tree_v1.json` is the machine-readable source of truth for:
 
-- Asset enablement and strategy modes.
+- Asset enablement, strategy modes, and per-asset gate thresholds (including the v1.1 `persistenceErMin`).
 - Runtime capital paths and account isolation.
 - Strategy parameters and risk parameters.
 - Input feature names.
