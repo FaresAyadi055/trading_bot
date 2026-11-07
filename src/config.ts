@@ -1,17 +1,17 @@
-import { randomBytes } from 'node:crypto'
-
 export const SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT'] as const
 export type Symbol = (typeof SYMBOLS)[number]
 export const BAR_MS = 4 * 3600_000
 /** Rolling candle window kept per symbol (constant storage). */
 export const WINDOW = 1000
 
-const generated = !process.env.ACCESS_TOKEN
+/** Required: the app refuses to boot without an explicit token (no weak fallback). */
+const accessToken = process.env.ACCESS_TOKEN
+if (!accessToken) throw new Error('ACCESS_TOKEN is not set. Copy .env.example to .env and set it.')
+
 export const config = {
   port: Number(process.env.PORT ?? 3000),
   dbPath: process.env.DB_PATH ?? 'data/trading.sqlite',
-  accessToken: process.env.ACCESS_TOKEN || randomBytes(18).toString('hex'),
-  tokenGenerated: generated,
+  accessToken,
   telegramToken: process.env.TELEGRAM_BOT_TOKEN ?? '',
   telegramChatId: process.env.TELEGRAM_CHAT_ID ?? '',
   binanceBase: (process.env.BINANCE_BASE_URL ?? 'https://api.binance.com').replace(/\/$/, ''),

@@ -125,7 +125,6 @@ app.get('/api/bots/:id/export', (c) => {
 })
 
 // ---- boot ----
-if (config.tokenGenerated) console.warn(`[auth] ACCESS_TOKEN not set; temporary token for this run: ${config.accessToken}`)
 if (!process.env.NO_WORKER) {
   startWorker()
   void flushNotifications()
