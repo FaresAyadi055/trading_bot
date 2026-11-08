@@ -68,7 +68,8 @@ const page = () => new Response(Bun.file(new URL('../public/index.html', import.
 app.get('/', (c) => c.redirect('/bot'))
 app.get('/bot', page) // frontend root
 app.get('/bot/', page)
-app.get('/bot/dashboard', page) // dashboard route
+app.get('/bot/dashboard', page)
+app.get('/bot/icon.svg', () => new Response(Bun.file(new URL('../public/icon.svg', import.meta.url)), { headers: { 'content-type': 'image/svg+xml', 'cache-control': 'no-store' } })) // dashboard route
 app.get('/health', (c) => c.json({ ok: true }))
 
 // ---- API ----
