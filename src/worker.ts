@@ -33,6 +33,7 @@ async function cycle() {
   running = true
   if (timer) clearTimeout(timer)
   let retryMs = 0
+  let hadError = false
   try {
     const expected = Math.floor(Date.now() / BAR_MS) * BAR_MS - BAR_MS
     for (const s of symbols) {
@@ -40,9 +41,9 @@ async function cycle() {
         const cs = await klines(s.symbol, s.since)
         if (cs.length) { s.since = cs[cs.length - 1]!.t; post({ type: 'candles', symbol: s.symbol, candles: cs }) }
         if (!cs.length || s.since! < expected) retryMs = 15_000 // newest candle not visible yet
-      } catch (e) { retryMs = 30_000; post({ type: 'error', symbol: s.symbol, message: String(e) }) }
+      } catch (e) { retryMs = 30_000; hadError = true; post({ type: 'error', symbol: s.symbol, message: String(e) }) }
     }
-    post({ type: 'cycleDone', at: Date.now() })
+    post({ type: 'cycleDone', at: Date.now(), ok: !hadError })
   } finally {
     running = false
     const next = (Math.floor(Date.now() / BAR_MS) + 1) * BAR_MS + delay

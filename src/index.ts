@@ -34,6 +34,7 @@ function startWorker() {
     else if (m.type === 'error') { setMeta('worker_error', `${new Date().toISOString()} ${m.symbol}: ${m.message}`); console.error('[worker]', m.symbol, m.message) }
     else if (m.type === 'cycleDone') {
       setMeta('worker_last_cycle', String(m.at))
+      if (m.ok) db.query('DELETE FROM meta WHERE key=?').run('worker_error') // a clean cycle supersedes any stale error
       try { processAll() } catch (err) { console.error('[processAll]', err) }
       void flushNotifications()
     }
