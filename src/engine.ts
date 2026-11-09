@@ -59,7 +59,10 @@ function fillEntry(bot: BotRow, st: AssetState, symbol: string, bar: { t: number
   const stopDistance = k * po.signalAtr
   const mult = params.risk.strategyMultiplier[po.strategy]
   const riskNotional = ((bot.cash * params.risk.riskPerTrade * mult) * fill) / stopDistance
-  const notional = Math.min(riskNotional, bot.cash * params.risk.maxPositionFraction, bot.cash)
+  // small-account rule: when even a 75%-slice of capital can't clear the minimum notional,
+  // a risk-sized entry is unpurchasable -> use 100% of capital (all-in) instead of standing dormant
+  const allIn = bot.cash * params.risk.allInCheckFraction < params.risk.minimumNotional
+  const notional = allIn ? bot.cash : Math.min(riskNotional, bot.cash * params.risk.maxPositionFraction, bot.cash)
   if (!(stopDistance > 0) || !(notional >= params.risk.minimumNotional)) {
     inc(st.rejectionCounters, 'sizing')
     fx.events.push({ ts: now, kind: 'entry_rejected', symbol, detail: `notional ${notional.toFixed(2)} below minimum or bad stop` })
@@ -67,6 +70,7 @@ function fillEntry(bot: BotRow, st: AssetState, symbol: string, bar: { t: number
   }
   const qty = notional / (fill * (1 + FEE))
   const entryFee = qty * fill * FEE
+  const preCash = bot.cash
   bot.cash -= qty * fill + entryFee
   const initialStop = fill - stopDistance
   const pos: Position = {
@@ -76,6 +80,7 @@ function fillEntry(bot: BotRow, st: AssetState, symbol: string, bar: { t: number
     initialRisk: stopDistance, initialRiskCash: qty * stopDistance, // R = pnl / (qty*(fill-initialStop))
   }
   st.position = pos
+  if (allIn) fx.events.push({ ts: now, kind: 'all_in_entry', symbol, detail: `cash ${preCash.toFixed(2)} below minimum when sized at ${(params.risk.allInCheckFraction * 100).toFixed(0)}% -> 100% of capital` })
   inc(st.tradeCounters, po.strategy === 'A' ? 'executedA' : 'executedC')
   fx.tx.push({
     ts: now, bar_time: bar.t, symbol, action: 'BUY', strategy: po.strategy, price: fill, qty, notional: qty * fill,

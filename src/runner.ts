@@ -3,7 +3,8 @@ import { WINDOW, type Symbol } from './config'
 import { buildSeries, latestMarket, type Series } from './features'
 import { stepAsset } from './engine'
 import { applyPending, gcMarketData, getBot, listBots, loadStates, lockedSymbol, saveBot, saveState, writeFx } from './bots'
-import type { Candle, Fx } from './types'
+import { params } from './tree'
+import type { AssetState, BotRow, Candle, Fx } from './types'
 
 export function upsertCandles(symbol: string, cs: Candle[]) {
   if (!cs.length) return
@@ -59,7 +60,20 @@ export function processBot(botId: string, series: Map<string, Series>, now = Dat
       writeFx(bot.id, fx)
     })
   }
+  killCheck(botId, bot, states)
   applyPending(bot.id, now)
+}
+
+/** Minimum-capital kill switch: deactivates the bot when post-exit capital can no longer trade. */
+export function killCheck(botId: string, bot: BotRow, states: Map<string, { st: AssetState; last: number | null }>) {
+  const flat = ![...states.values()].some((s) => s.st.position || s.st.pendingOrder)
+  if (bot.status !== 'active' || bot.cash >= params.risk.minimumNotional || !flat) return
+  tx(() => {
+    db.query("UPDATE bots SET status='inactive', pending_action=NULL, updated_at=? WHERE id=?").run(Date.now(), bot.id)
+    db.query('INSERT INTO events(bot_id,ts,kind,symbol,detail) VALUES(?,?,?,NULL,?)')
+      .run(bot.id, Date.now(), 'auto_stopped', `capital ${bot.cash.toFixed(2)} USDT < ${params.risk.minimumNotional} USDT minimum -> deactivated`)
+  })
+  console.log(`[runner] bot ${bot.id} auto-stopped: capital ${bot.cash.toFixed(2)} below ${params.risk.minimumNotional}`)
 }
 
 /** Evaluate every active bot against the latest closed candles (also used for crash catch-up). */

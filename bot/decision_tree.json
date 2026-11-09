@@ -1,7 +1,7 @@
 {
   "schema": "decision-tree/v2",
   "name": "asset-aware-donchian-vceb-4h-spot",
-  "treeVersion": "v1.2",
+  "treeVersion": "v1.3",
   "description": "Asset-aware long-only spot decision engine for BTC, ETH, BNB and SOL. Strategy A (Donchian) is primary; Strategy C (VCEB volatility-compression breakout) is secondary and configured per asset. v1.1 adds the ETH-only Kaufman persistence gate on A (ER-20 >= 0.30); v1.2 adds SOLUSDT with the BNB asset mode (A + unrestricted C, research/tentative status).",
   "market": {
     "venue": "Binance spot",
@@ -244,8 +244,11 @@
       "maxAlloc": 1.0,
       "globalHardStopAtr": 4.0,
       "minimumNotional": 10.0,
+      "allInCheckFraction": 0.75,
+      "allInRule": "small-account sizing: when cash * allInCheckFraction < minimumNotional at entry, notional = 100% of cash (risk sizing is unpurchasable below the minimum)",
+      "killRule": "the bot auto-stops (inactive) when total capital (cash, post-exit fees) < minimumNotional and no position or pending order remains",
       "sizingCapitalField": "assetState.cash",
-      "formula": "notional = min((cash * riskPerTrade * strategyMultiplier * fill / stopDistance), cash * maxPositionFraction, cash)",
+      "formula": "notional = allIn ? cash : min((cash * riskPerTrade * strategyMultiplier * fill / stopDistance), cash * maxPositionFraction, cash)",
       "rejectIfStopDistanceNonPositive": true,
       "rejectIfNotionalBelowMinimum": true
     },
