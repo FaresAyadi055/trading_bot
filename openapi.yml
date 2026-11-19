@@ -1,0 +1,318 @@
+openapi: 3.0.3
+info:
+  title: Trading bot API
+  version: 3.0.0
+  description: |
+    Binance spot trading bot manager (4h candles, REST only). `MODE=live` trades real funds through the Binance
+    Convert API; `MODE=test` trades market orders on the Binance spot testnet. The API key is Convert-only (no withdrawals).
+    **Capital ledger:** every bot is a sub-allocation of the real account. `unallocated = free USDT - sum(bot cash)`;
+    creating a bot, raising its capital or activating it is refused with `409 over_allocation` / `capital_shortfall`
+    when it does not fit, and with `503 binance_unavailable` when the balance cannot be read (fail closed).
+    There is no catch-up replay: after an outage the missed bars are skipped and a single Telegram interrupt alert is sent. Strategy: Donchian breakout (A) + VCEB
+    volatility-compression breakout (C), one position slot per bot, any Binance spot USDT pair.
+    All `/api/*` endpoints require `Authorization: Bearer <ACCESS_TOKEN>` (or `x-access-token`).
+    Actions that must not interrupt a trade accept `when=after_exit` (default): they are stored in the
+    bot's `pendingActions` and applied as soon as the bot is flat. `when=now` closes any open
+    position at market (exit reason `MANUAL`) and applies the action immediately.
+servers:
+  - url: http://localhost:3000
+security:
+  - bearer: []
+components:
+  securitySchemes:
+    bearer: { type: http, scheme: bearer }
+  schemas:
+    Symbol: { type: string, pattern: '^[A-Z0-9]{2,20}USDT$', example: SOLUSDT, description: Any Binance spot USDT pair in TRADING status (verified against exchangeInfo when first used; lower-case input is upper-cased) }
+    Strategy: { type: string, enum: [A, C], description: A = Donchian, C = VCEB }
+    When: { type: string, enum: [now, after_exit], default: after_exit }
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+        issues: { type: array, items: { type: object, properties: { path: { type: string }, message: { type: string } } } }
+    PendingAction:
+      type: object
+      required: [type, requestedAt]
+      properties:
+        type: { type: string, enum: [deactivate, delete, edit_assets, set_capital] }
+        assets: { type: array, items: { $ref: '#/components/schemas/Symbol' } }
+        capital: { type: number }
+        requestedAt: { type: integer }
+    Position:
+      type: object
+      properties:
+        symbol: { type: string }
+        strategy: { $ref: '#/components/schemas/Strategy' }
+        strategyName: { type: string, enum: [Donchian, VCEB] }
+        entryFill: { type: number }
+        qty: { type: number }
+        notional: { type: number }
+        initialStop: { type: number }
+        stop: { type: number }
+        hardStop: { type: number }
+        ratcheted: { type: boolean }
+        barsHeld: { type: integer }
+    Bot:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        mode: { type: string, enum: [single, multi] }
+        assets: { type: array, items: { $ref: '#/components/schemas/Symbol' } }
+        status: { type: string, enum: [active, inactive] }
+        initialCapital: { type: number, description: USDT capital base }
+        cash: { type: number }
+        equity: { type: number, description: cash + open position marked at the last stored close }
+        lastPrice: { type: number, nullable: true }
+        realizedPnl: { type: number }
+        closedTrades: { type: integer }
+        position: { allOf: [{ $ref: '#/components/schemas/Position' }], nullable: true }
+        pendingOrder: { type: object, nullable: true, description: 'Queued order: kind entry|exit, symbol, strategy, queuedBar (and score/atr/riskMult for entries)' }
+        pendingActions: { type: array, items: { $ref: '#/components/schemas/PendingAction' } }
+        lastProcessedBar: { type: integer, nullable: true }
+        tracking:
+          type: object
+          description: Which of the bot's assets are currently pulled from Binance and which are paused (the bot is in a trade on another asset)
+          properties:
+            pulled: { type: array, items: { type: string } }
+            paused: { type: array, items: { type: string } }
+        account:
+          type: object
+          description: Per-bot regime and protections (BOT_SPEC §8, §9.4)
+          properties:
+            regime: { type: string, enum: [BULL, NEUTRAL, BEAR] }
+            minScore: { type: number }
+            riskMult: { type: number }
+            cooldownLeft: { type: integer }
+            paused: { type: boolean }
+            pauseUntilBar: { type: integer, nullable: true }
+            consecutiveLosses: { type: integer }
+            peak: { type: number }
+            drawdownPct: { type: number }
+            weekR: { type: number }
+            frozen: { type: object, properties: { A: { type: boolean }, C: { type: boolean } } }
+        counters: { type: object, additionalProperties: { type: number }, description: 'executedA/C, trades, exit_*, blocked_<reason>, ...' }
+        createdAt: { type: integer }
+        updatedAt: { type: integer }
+    CapitalSnapshot:
+      type: object
+      description: Real account balances reconciled with the bots' sub-allocations
+      properties:
+        at: { type: integer }
+        mode: { type: string, enum: [live, test] }
+        exchange: { type: string, example: binance-convert }
+        cached: { type: boolean, description: served from the balance cache (BALANCE_TTL_SECONDS) }
+        usdt: { type: object, properties: { free: { type: number }, locked: { type: number } } }
+        actualCapital: { type: number, description: free USDT + cost basis of open positions }
+        allocated: { type: number, description: sum(bot cash + open position cost); inactive bots included }
+        unallocated: { type: number, description: free USDT - sum(bot cash); negative = bots claim more than the account holds }
+        botCash: { type: number }
+        inPositions: { type: number }
+        shortfall: { type: number, description: '> 0 when the bots claim more cash than is free in the account' }
+        allocatedPct: { type: number }
+        ok: { type: boolean, description: false when drift is non-empty; new entries are blocked meanwhile }
+        drift: { type: array, items: { type: string } }
+        bots:
+          type: array
+          items: { type: object, properties: { id: { type: string }, name: { type: string }, status: { type: string }, cash: { type: number }, positionCost: { type: number }, allocated: { type: number }, share: { type: number, description: '% of actual capital' } } }
+        holdings:
+          type: array
+          description: Assets held by bot positions vs the account balance
+          items: { type: object, properties: { asset: { type: string }, needed: { type: number }, free: { type: number }, ok: { type: boolean } } }
+    Transaction:
+      type: object
+      properties:
+        id: { type: integer }
+        bot_id: { type: string }
+        ts: { type: integer }
+        bar_time: { type: integer, nullable: true }
+        symbol: { type: string, nullable: true }
+        action: { type: string, enum: [BUY, SELL, CAPITAL] }
+        strategy: { type: string, nullable: true, description: 'A (Donchian) or C (VCEB)' }
+        price: { type: number, nullable: true }
+        qty: { type: number, nullable: true }
+        notional: { type: number, nullable: true }
+        fee: { type: number, nullable: true }
+        pnl: { type: number, nullable: true }
+        pnl_pct: { type: number, nullable: true }
+        r_multiple: { type: number, nullable: true }
+        exit_reason: { type: string, nullable: true, description: STOP, HARD_STOP, KILL, TIME, TRAIL or MANUAL }
+        cash_after: { type: number }
+        order_ref: { type: string, nullable: true, description: Binance Convert order id / testnet order id of the real fill (null for CAPITAL rows) }
+  responses:
+    Unauthorized: { description: Missing or invalid token, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    NotFound: { description: Bot not found, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Conflict: { description: 'Capital rule violated: over_allocation (needs more than the unallocated USDT) or capital_shortfall (the bots already claim more cash than the account holds)', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Unavailable: { description: Binance could not be reached (symbol verification or account balance; the capital ledger fails closed), content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    Invalid: { description: 'Validation failed (bad body, unknown / non-USDT / non-trading symbol)', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+paths:
+  /:
+    get:
+      summary: Redirects to /bot
+      security: []
+      responses: { '302': { description: Redirect } }
+  /bot:
+    get:
+      summary: Frontend root (static HTML, client-side rendered; asks for the access token)
+      security: []
+      responses: { '200': { description: HTML page, content: { text/html: {} } } }
+  /bot/dashboard:
+    get:
+      summary: Dashboard route (same page as /bot)
+      security: []
+      responses: { '200': { description: HTML page, content: { text/html: {} } } }
+  /health:
+    get:
+      summary: Liveness probe
+      security: []
+      responses: { '200': { description: OK } }
+  /api/status:
+    get:
+      summary: Service status (worker heartbeat, candle windows, schema/strategy versions, which symbols are pulled)
+      description: |
+        `symbolsTracked` = assets listed by an active bot; `symbolsPulled` = assets the worker actually fetches (a bot in a
+        trade only needs its own asset); `symbolsPaused` = tracked but not pulled. Also returns `binanceBase` (used by the
+        dashboard asset picker) and `maxAssetsPerBot`. Live-version fields: `mode` (`live`|`test`), `exchange` (execution
+        backend), `executionBase`, `heartbeatAt` (last successful connectivity probe; a gap longer than
+        `INTERRUPT_MIN_SECONDS` triggers the Telegram interrupt alert after reconnect).
+      responses:
+        '200':
+          description: Status
+          content: { application/json: { schema: { type: object } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/capital:
+    get:
+      summary: Account capital vs bot sub-allocations (allocated / unallocated, drift check)
+      description: Reads the real balances from the exchange (cached for BALANCE_TTL_SECONDS unless `fresh=1`).
+      parameters: [{ name: fresh, in: query, schema: { type: string, enum: ['1'] }, description: Bypass the balance cache }]
+      responses:
+        '200': { description: Snapshot, content: { application/json: { schema: { $ref: '#/components/schemas/CapitalSnapshot' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/market:
+    get:
+      summary: Latest computed market features per pulled symbol (one overwritten row per symbol; includes dataOk, signalA, signalC)
+      responses:
+        '200': { description: Features, content: { application/json: { schema: { type: array, items: { type: object } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/bots:
+    get:
+      summary: List bot instances
+      responses:
+        '200': { description: Bots, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Bot' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      summary: Create a bot (live from the next closed 4h candle)
+      description: |
+        Assets are validated against Binance exchangeInfo (spot, TRADING, USDT quote) and, in live mode, must be convertible
+        with USDT. `capital` must fit into the unallocated account capital (checked against a fresh balance).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [assets, capital]
+              properties:
+                name: { type: string, maxLength: 60 }
+                assets: { type: array, minItems: 1, maxItems: 50, uniqueItems: true, items: { $ref: '#/components/schemas/Symbol' }, description: 'maxItems = MAX_ASSETS_PER_BOT' }
+                capital: { type: number, exclusiveMinimum: 0, description: USDT }
+                active: { type: boolean, default: true }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Bot' } } } }
+        '400': { $ref: '#/components/responses/Invalid' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/bots/{id}:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+    get:
+      summary: Bot details
+      responses:
+        '200': { description: Bot, content: { application/json: { schema: { $ref: '#/components/schemas/Bot' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      summary: Rename, edit trading assets and/or update USDT capital
+      description: |
+        Asset edits that drop the asset of an open trade wait for the exit (`when=after_exit`) or close
+        it immediately (`when=now`). Capital changes are never applied mid-trade; they are scheduled and
+        applied when the bot is flat (cash is adjusted by the difference to the previous capital base).
+        An **increase** must fit the unallocated capital, both when requested and again when applied; a scheduled increase
+        that no longer fits is dropped with a Telegram notice instead of over-allocating.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                assets: { type: array, items: { $ref: '#/components/schemas/Symbol' } }
+                capital: { type: number }
+                when: { $ref: '#/components/schemas/When' }
+      responses:
+        '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/Bot' } } } }
+        '400': { $ref: '#/components/responses/Invalid' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+    delete:
+      summary: Delete a bot and its whole footprint (state, transactions, events)
+      description: '`when=now` first closes an open position at market (reason MANUAL, logged and notified), then deletes.'
+      parameters: [{ name: when, in: query, schema: { $ref: '#/components/schemas/When' } }]
+      responses:
+        '200': { description: Deleted now }
+        '202': { description: Scheduled; will be deleted when the open trade exits }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/bots/{id}/activate:
+    post:
+      summary: Activate / reactivate (also cancels a scheduled deactivation)
+      description: Refused (409 `capital_shortfall`) while the account does not back the bots' cash.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: Bot, content: { application/json: { schema: { $ref: '#/components/schemas/Bot' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/bots/{id}/deactivate:
+    post:
+      summary: Deactivate now (sells the open position for real) or after the current trade exits
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        content: { application/json: { schema: { type: object, properties: { when: { $ref: '#/components/schemas/When' } } } } }
+      responses:
+        '200': { description: Bot, content: { application/json: { schema: { $ref: '#/components/schemas/Bot' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: No market price available to close at, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /api/bots/{id}/pending/{type}:
+    delete:
+      summary: Cancel a scheduled action
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: type, in: path, required: true, schema: { type: string, enum: [deactivate, delete, edit_assets, set_capital] } }
+      responses:
+        '200': { description: Bot, content: { application/json: { schema: { $ref: '#/components/schemas/Bot' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/bots/{id}/transactions:
+    get:
+      summary: Transaction log, newest first
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 200, maximum: 1000 } }
+        - { name: before, in: query, description: Return rows with id lower than this, schema: { type: integer } }
+      responses:
+        '200': { description: Rows, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Transaction' } } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/bots/{id}/events:
+    get:
+      summary: Lifecycle, signal, regime and blocked-trade events (newest 200)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: Events, content: { application/json: { schema: { type: array, items: { type: object } } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/bots/{id}/export:
+    get:
+      summary: Download all bot data as JSON (profile, bot state, transactions, events)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: JSON attachment, content: { application/json: { schema: { type: object } } } }
+        '404': { $ref: '#/components/responses/NotFound' }

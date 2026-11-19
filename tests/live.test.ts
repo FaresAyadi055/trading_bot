@@ -1,0 +1,265 @@
+import { test, expect, beforeAll, beforeEach, afterAll } from 'bun:test'
+process.env.DB_PATH = ':memory:'
+process.env.MODE = 'test'
+process.env.NO_WORKER = '1'
+process.env.ACCESS_TOKEN = 'test-token'
+process.env.TELEGRAM_BOT_TOKEN = 'x'
+process.env.TELEGRAM_CHAT_ID = '1'
+process.env.INTERRUPT_MIN_SECONDS = '120'
+
+const BAR = 4 * 3600_000
+let m: any
+let ex: any
+beforeAll(async () => {
+  const exch = await import('../src/exchange')
+  const { MockExchange } = await import('./mock_exchange')
+  ex = new MockExchange(1000, { BTCUSDT: 100, ETHUSDT: 50 })
+  exch.setExchange(ex)
+  m = {
+    bots: await import('../src/bots'), live: await import('../src/live'), cap: await import('../src/capital'), rt: (await import('../src/runtime')).rt,
+    db: (await import('../src/db')).db, runner: await import('../src/runner'), intr: await import('../src/interrupt'), engine: await import('../src/engine'),
+    time: await import('../src/time'),
+  }
+  m.intr.probeOpts.data = false // the heartbeat probes only the mock exchange
+  m.rt.live = true // live execution + capital enforcement (index.ts does this at boot)
+})
+beforeEach(() => {
+  m.db.query('DELETE FROM bots').run()
+  m.db.query('DELETE FROM notifications').run()
+  ex.free = { USDT: 1000 }; ex.calls = []; ex.failNext = []; ex.offline = false
+  ex.price = { BTCUSDT: 100, ETHUSDT: 50 }
+  m.cap.resetCapitalCache()
+})
+
+const create = async (capital: number, assets = ['BTCUSDT']) => m.bots.createBot({ name: 't', assets, capital }, await m.cap.fetchFree())
+/** 5s after the open of the current bar: the moment a live entry decided on the previous bar is executed. */
+const T = () => m.time.barOpen(Date.now()) + 5000
+const pendingEntry = (id: string, symbol = 'BTCUSDT') => {
+  const { st, last } = m.bots.loadState(id)
+  st.pending = { kind: 'entry', symbol, strategy: 'A', queuedBar: m.time.barIndex(Date.now() - BAR), score: 0.7, atr: 2, stopAtr: 3, riskMult: 1 }
+  m.bots.saveState(id, st, last)
+}
+
+test('capital: bots can never allocate more than the account holds', async () => {
+  const a = await create(600)
+  let s = await m.cap.snapshot(true)
+  expect(s.allocated).toBe(600); expect(s.unallocated).toBe(400); expect(s.actualCapital).toBe(1000); expect(s.ok).toBe(true)
+  await expect(create(401)).rejects.toMatchObject({ status: 409 })           // would over-allocate
+  const b = await create(400)                                                   // exactly the rest fits
+  expect((await m.cap.snapshot(true)).unallocated).toBe(0)
+  await expect(create(1)).rejects.toMatchObject({ status: 409 })
+  // growing a bot is an allocation too
+  expect(() => m.bots.updateBot(a.id, { capital: 700 }, 1000)).toThrow(/over_allocation/)
+  // shrinking frees capital
+  m.bots.updateBot(a.id, { capital: 500 }, 1000)
+  expect((await m.cap.snapshot(true)).unallocated).toBe(100)
+  m.bots.updateBot(a.id, { capital: 600 }, 1000)                                // back up: fits again
+  m.bots.deleteBot(b.id, 'now')
+  expect((await m.cap.snapshot(true)).unallocated).toBe(400)
+})
+
+test('capital: concurrent creates cannot both pass the check', async () => {
+  const free = await m.cap.fetchFree()
+  const r = await Promise.allSettled([
+    (async () => m.bots.createBot({ name: 'x', assets: ['BTCUSDT'], capital: 700 }, free))(),
+    (async () => m.bots.createBot({ name: 'y', assets: ['BTCUSDT'], capital: 700 }, free))(),
+  ])
+  expect(r.filter((x) => x.status === 'fulfilled').length).toBe(1)
+  expect(m.bots.listBots().length).toBe(1)
+})
+
+test('capital: drift (account lost USDT) is reported and blocks growth / activation', async () => {
+  const a = await create(800)
+  ex.free.USDT = 500                                                            // user moved money out
+  const s = await m.cap.snapshot(true)
+  expect(s.ok).toBe(false); expect(s.shortfall).toBeCloseTo(300); expect(s.drift[0]).toMatch(/USDT shortfall/)
+  await expect(create(1)).rejects.toMatchObject({ status: 409 })
+  m.bots.deactivate(a.id, 'now')
+  expect(() => m.bots.activate(a.id, 500)).toThrow(/capital_shortfall/)
+})
+
+test('live entry: pending entry is bought for real, fill is booked with order ref, cash and exchange agree', async () => {
+  const bot = await create(1000)
+  pendingEntry(bot.id)
+  await m.live.executeBot(bot.id, T())
+  const buy = ex.calls.find((c: any) => c.op === 'buy')
+  expect(buy.symbol).toBe('BTCUSDT')
+  const { st } = m.bots.loadState(bot.id)
+  expect(st.pending).toBeNull()
+  expect(st.position.symbol).toBe('BTCUSDT')
+  expect(st.position.qty).toBeCloseTo(ex.free.BTC, 8)                           // bot position == real balance
+  const b = m.bots.getBot(bot.id)
+  expect(b.cash).toBeCloseTo(ex.free.USDT, 6)                                   // bot cash == real free USDT (only bot)
+  const tx = m.db.query("SELECT * FROM transactions WHERE bot_id=? AND action='BUY'").get(bot.id) as any
+  expect(tx.order_ref).toBe('m1')
+  expect(st.position.stop).toBeLessThan(st.position.entryFill)
+  const s = await m.cap.snapshot(true)
+  expect(s.ok).toBe(true)
+  expect(s.inPositions).toBeCloseTo(st.position.notional, 6)
+  expect(s.holdings[0]).toMatchObject({ asset: 'BTC', ok: true })
+})
+
+test('live entry: capital guard refuses to buy when the account no longer backs the bots', async () => {
+  const bot = await create(1000)
+  pendingEntry(bot.id)
+  ex.free.USDT = 400
+  await m.live.executeBot(bot.id, T())
+  expect(ex.calls.some((c: any) => c.op === 'buy')).toBe(false)
+  expect(m.bots.loadState(bot.id).st.pending).toBeNull()
+  expect(m.bots.loadState(bot.id).st.position).toBeNull()
+  expect((m.db.query("SELECT detail FROM events WHERE kind='entry_rejected'").get() as any).detail).toMatch(/account has/)
+})
+
+test('live entry: a failed buy is dropped and never retried; stale entries expire', async () => {
+  const bot = await create(500)
+  pendingEntry(bot.id)
+  ex.failNext.push({ op: 'buy', err: new Error('boom') })
+  await m.live.executeBot(bot.id, T())
+  expect(m.bots.loadState(bot.id).st.pending).toBeNull()
+  await m.live.executeBot(bot.id, T())
+  expect(ex.calls.filter((c: any) => c.op === 'buy').length).toBe(1)
+  // an entry decided 20 minutes ago is no longer executed
+  const { st, last } = m.bots.loadState(bot.id)
+  st.pending = { kind: 'entry', symbol: 'BTCUSDT', strategy: 'A', queuedBar: m.time.barIndex(Date.now() - BAR), score: 0.7, atr: 2, stopAtr: 3, riskMult: 1 }
+  m.bots.saveState(bot.id, st, last)
+  await m.live.executeBot(bot.id, (st.pending.queuedBar + 1) * BAR + 20 * 60_000)
+  expect(ex.calls.filter((c: any) => c.op === 'buy').length).toBe(1)
+})
+
+test('stop monitor: C stop and hard stop sell at market and book real P/L; other bots untouched', async () => {
+  const bot = await create(1000)
+  pendingEntry(bot.id)
+  await m.live.executeBot(bot.id, T())
+  const { st } = m.bots.loadState(bot.id)
+  expect(st.position.strategy).toBe('A')
+  ex.price.BTCUSDT = st.position.stop - 0.01                                    // below A's close-based trail: NOT a stop for A
+  await m.live.monitorTick(T())
+  expect(m.bots.loadState(bot.id).st.position).not.toBeNull()
+  ex.price.BTCUSDT = st.position.hardStop - 0.5                                 // hard stop breached
+  await m.live.monitorTick(T())
+  const after = m.bots.loadState(bot.id)
+  expect(after.st.position).toBeNull()
+  expect(after.st.exitNow).toBeUndefined()
+  const sell = m.db.query("SELECT * FROM transactions WHERE bot_id=? AND action='SELL'").get(bot.id) as any
+  expect(sell.exit_reason).toBe('HARD_STOP'); expect(sell.pnl).toBeLessThan(0); expect(sell.order_ref).toBeTruthy()
+  expect(m.bots.getBot(bot.id).cash).toBeCloseTo(ex.free.USDT, 6)               // books == exchange
+  expect(ex.free.BTC).toBeCloseTo(0, 8)
+})
+
+test('sell failure keeps the position, retries with back-off and eventually books', async () => {
+  const bot = await create(1000)
+  pendingEntry(bot.id)
+  await m.live.executeBot(bot.id, T())
+  const { st, last } = m.bots.loadState(bot.id)
+  st.exitNow = { reason: 'KILL', bar: 1, t: 1 }; m.bots.saveState(bot.id, st, last)
+  ex.failNext.push({ op: 'sell', err: new Error('net down') })
+  const t0 = T()
+  await m.live.executeBot(bot.id, t0)
+  expect(m.bots.loadState(bot.id).st.position).not.toBeNull()
+  expect(ex.calls.filter((c: any) => c.op === 'sell').length).toBe(1)           // the failed attempt
+  await m.live.executeBot(bot.id, t0 + 1000)                                    // inside back-off: no new call
+  expect(ex.calls.filter((c: any) => c.op === 'sell').length).toBe(1)
+  await m.live.executeBot(bot.id, t0 + 61_000)
+  expect(m.bots.loadState(bot.id).st.position).toBeNull()
+  expect((m.db.query("SELECT exit_reason FROM transactions WHERE action='SELL'").get() as any).exit_reason).toBe('KILL')
+})
+
+test('closeBotNow sells for real; forceClose refuses to fake a live sale', async () => {
+  const bot = await create(1000)
+  pendingEntry(bot.id)
+  await m.live.executeBot(bot.id, T())
+  expect(() => m.bots.deactivate(bot.id, 'now')).toThrow(/sold on the exchange/)
+  await m.live.closeBotNow(bot.id)
+  expect(m.bots.loadState(bot.id).st.position).toBeNull()
+  expect((m.db.query("SELECT exit_reason FROM transactions WHERE action='SELL'").get() as any).exit_reason).toBe('MANUAL')
+  expect(m.bots.deactivate(bot.id, 'now').status).toBe('inactive')
+})
+
+test('interrupt: no replay — stale bars are skipped, time-based state advances, one alert is queued', async () => {
+  const bot = await create(500)
+  const now = Date.now()
+  const lastClosed = m.time.lastClosedBar(now)
+  const { st } = m.bots.loadState(bot.id)
+  st.position = { symbol: 'BTCUSDT', strategy: 'A', entryTs: 1, entryFill: 100, qty: 1, notional: 100, initialStop: 97, stop: 97, hardStop: 96, highestClose: 100, highestHigh: 100, ratcheted: false, barsHeld: 5, riskUsdt: 3 }
+  st.cooldown = 10
+  m.bots.saveState(bot.id, st, lastClosed - 10 * BAR)                           // 10 bars behind
+  ex.free.BTC = 1
+  const text = await m.intr.handleReconnect(now - 3 * 3600_000, now)
+  const after = m.bots.loadState(bot.id)
+  const fresh = now - (lastClosed + BAR) <= m.time.LIVE_BAR_MAX_AGE_MS
+  const skipped = fresh ? 9 : 10
+  expect(after.st.counters.skipped_bars).toBe(skipped)
+  expect(after.st.position.barsHeld).toBe(5 + skipped)
+  expect(after.st.cooldown).toBe(0)
+  expect(after.last).toBe(lastClosed - (fresh ? BAR : 0))
+  expect(text).toContain('CONNECTION INTERRUPTED'); expect(text).toContain('NOT evaluated'); expect(text).toContain('HOLDING BTCUSDT')
+  expect(text).toContain('3h')
+  const n = m.db.query("SELECT * FROM notifications WHERE kind='interrupt'").all() as any[]
+  expect(n.length).toBe(1)
+  expect(m.db.query("SELECT COUNT(*) c FROM transactions WHERE bot_id=?").get(bot.id)).toEqual({ c: 0 }) // nothing was traded by the skipped bars
+})
+
+test('interrupt: heartbeat detects the gap only after reconnect, once', async () => {
+  await create(100)
+  const calls: string[] = []
+  const hooks = { onReconnect: () => { calls.push('reconnect') }, afterAlert: () => { calls.push('after') } }
+  m.intr._setLastOk(Date.now() - 10 * 60_000)
+  ex.offline = true
+  await m.intr._tick(hooks)                                                    // still offline: nothing
+  expect(calls).toEqual([])
+  expect((m.db.query("SELECT COUNT(*) c FROM notifications WHERE kind='interrupt'").get() as any).c).toBe(0)
+  ex.offline = false
+  await m.intr._tick(hooks)                                                    // back: one alert
+  expect(calls).toEqual(['reconnect', 'after'])
+  expect((m.db.query("SELECT COUNT(*) c FROM notifications WHERE kind='interrupt'").get() as any).c).toBe(1)
+  await m.intr._tick(hooks)                                                    // next probe: no second alert
+  expect((m.db.query("SELECT COUNT(*) c FROM notifications WHERE kind='interrupt'").get() as any).c).toBe(1)
+  m.intr._setLastOk(Date.now() - 30_000)                                        // short blip < threshold: silent
+  await m.intr._tick(hooks)
+  expect((m.db.query("SELECT COUNT(*) c FROM notifications WHERE kind='interrupt'").get() as any).c).toBe(1)
+})
+
+afterAll(() => { m.rt.live = false })
+
+function series(n: number, crashAt: number) {
+  const END = Math.floor(Date.now() / BAR) * BAR - BAR
+  const out = []
+  let p = 100
+  const T0 = END - (n - 1) * BAR
+  for (let i = 0; i < n; i++) {
+    const noise = Math.sin(i * 1.7) * 0.3
+    const o = p
+    p = Math.max(1, p * (1 + (i < crashAt ? 0.004 : -0.03) + noise * 0.01))
+    out.push({ t: T0 + i * BAR, o, h: Math.max(o, p) * 1.003, l: Math.min(o, p) * 0.997, c: p, v: i % 5 === 0 ? 300 : 100 })
+  }
+  return out
+}
+
+test('pipeline: engine decides bar by bar, real orders are placed at the open, books == exchange, no simulated fills', async () => {
+  const bot = await create(1000, ['PEPEUSDT'])
+  const cs = series(420, 330)
+  m.runner.upsertCandles('PEPEUSDT', cs.slice(0, 251))
+  const { st: s0 } = m.bots.loadState(bot.id)
+  m.bots.saveState(bot.id, s0, cs[250].t)
+  for (let i = 251; i < cs.length; i++) {
+    m.runner.upsertCandles('PEPEUSDT', [cs[i]])
+    const now = cs[i].t + BAR + 5000
+    ex.price.PEPEUSDT = cs[i].c
+    m.runner.processAll(now)
+    await m.live.executeAll(now)
+  }
+  const txs = m.db.query('SELECT * FROM transactions WHERE bot_id=? ORDER BY id').all(bot.id) as any[]
+  const buys = txs.filter((t) => t.action === 'BUY'), sells = txs.filter((t) => t.action === 'SELL')
+  expect(buys.length).toBeGreaterThan(0)
+  expect(sells.length).toBeGreaterThan(0)
+  expect(txs.every((t) => t.order_ref)).toBe(true)                               // every fill came from the exchange
+  expect(ex.calls.filter((c: any) => c.op === 'buy').length).toBe(buys.length)
+  expect(ex.calls.filter((c: any) => c.op === 'sell').length).toBe(sells.length)
+  const { st } = m.bots.loadState(bot.id)
+  expect(st.exitNow).toBeUndefined()
+  if (!st.position) {
+    expect(m.bots.getBot(bot.id).cash).toBeCloseTo(ex.free.USDT, 6)              // flat: bot cash is exactly the account's USDT
+    expect(ex.free.PEPE ?? 0).toBeCloseTo(0, 8)
+  } else expect(st.position.qty).toBeCloseTo(ex.free.PEPE, 8)
+  expect((await m.cap.snapshot(true)).ok).toBe(true)
+})
