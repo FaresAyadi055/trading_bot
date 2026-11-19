@@ -35,7 +35,7 @@ bun run parity              # engine vs the spec's Python reference (needs pytho
   request fails closed (503). A scheduled capital increase is re-checked when it is applied. Before every buy the real
   balances are compared with the books again; on drift (account holds less than the bots claim) entries are blocked.
 - **No playback after an interruption.** The old catch-up replay of missed bars is gone. A heartbeat probes Binance
-  every `HEARTBEAT_SECONDS` and stores `heartbeat_at` only while it is reachable. When the first successful probe after
+  every 60 seconds and stores `heartbeat_at` only while it is reachable. When the first successful probe after
   a gap longer than `INTERRUPT_MIN_SECONDS` happens (process restart *or* network / Binance outage), the bars that
   closed meanwhile are **skipped, never replayed**, open positions are re-checked against their stops immediately, and
   **one Telegram alert** is sent: offline window, number of skipped bars, per-bot position / stop levels and the
@@ -99,7 +99,6 @@ requested by the browser directly from Binance, never through the Hono server.
 | `BINANCE_DATA_URL` | `https://api.binance.com` | public candles + asset list (mainnet in both modes: testnet candles are sparse) |
 | `FETCH_DELAY_MS` | 5000 | wait after each 4h boundary before fetching |
 | `STOP_POLL_SECONDS` | 15 | price-monitor period for stops (min 5) |
-| `HEARTBEAT_SECONDS` | 15 | connectivity probe period (min 5) |
 | `INTERRUPT_MIN_SECONDS` | 120 | gap that counts as an interruption (min 30) |
 | `MAX_ENTRY_SLIPPAGE_PCT` | 1 | refuse a buy priced more than this above the reference |
 | `BALANCE_TTL_SECONDS` | 10 | balance cache for the dashboard / ledger view (order guards always read fresh) |

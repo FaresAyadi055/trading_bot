@@ -1,7 +1,7 @@
 // Interrupt handling. There is NO catch-up replay any more: bars that closed while the bot was blind are skipped
 // (runner.skipStaleBars), and the operator is told about it with ONE Telegram alert once the connection is back.
 //
-// Detection: a heartbeat probes Binance every HEARTBEAT_SECONDS and persists `heartbeat_at` ONLY when the probe succeeds.
+// Detection: a heartbeat probes Binance every 60s and persists `heartbeat_at` ONLY when the probe succeeds.
 // The gap between that timestamp and the first successful probe afterwards is the interruption. The same code covers a
 // process that was down (the timestamp survives in SQLite) and a network / Binance outage while the process kept running.
 import { config } from './config'

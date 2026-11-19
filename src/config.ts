@@ -39,7 +39,7 @@ export const config = {
   /** How often open positions are checked against their stop levels (Convert has no resting stop orders). */
   stopPollMs: Math.max(5, num(process.env.STOP_POLL_SECONDS, 15)) * 1000,
   /** Heartbeat / connectivity probe period. */
-  heartbeatMs: Math.max(5, num(process.env.HEARTBEAT_SECONDS, 15)) * 1000,
+  heartbeatMs: 60_000,
   /** A gap in the heartbeat longer than this counts as an interruption (alert after reconnect). */
   interruptMinMs: Math.max(30, num(process.env.INTERRUPT_MIN_SECONDS, 120)) * 1000,
   /** A market BUY whose price is more than this % above the reference price is refused (Convert: checked on the quote, before accepting). */
