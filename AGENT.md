@@ -100,7 +100,7 @@ carries `Strategy: Donchian (A)` / `VCEB (C)`.
   (symbol, strategy, reason) is alerted at most once per 6 bars; all occurrences are counted for the daily summary.
 - **Daily summary** after the 20:00 UTC bar (6th candle of the day): `buildDailySummary` uses `BotState.day`
   (actions, signals, blocked counts), bot status, and 24h stats from the stored candles. Reset after each day end.
-- `interrupt`: one message per detected interruption (offline window, bars skipped, per-bot position / stops, capital reconciliation). Also `lifecycle` messages for `ORDER FAILED` (rate-limited 30 min per bot+side) and `CAPITAL INCREASE REJECTED`.
+- `interrupt`: one message per detected interruption (offline window, bars skipped, per-bot position / stops, capital reconciliation). Also `lifecycle` messages for `ORDER FAILED` (buy/sell rejected by the Binance API, with the API error reason; rate-limited 30 min per bot+side) and `CAPITAL INCREASE REJECTED`.
 - No replay exists any more, so there is no suppression of replayed alerts.
 
 ## Status

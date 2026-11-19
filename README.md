@@ -71,7 +71,7 @@ bun run parity              # engine vs the spec's Python reference (needs pytho
 - **Telegram notifications** (set `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`), each naming the bot and the strategy used
   (*Donchian (A)* or *VCEB (C)*):
   - every bot action: entry signal queued, **BUY**, exit signal queued, **SELL** (P/L, R, reason), kill-switch stop
-    tightening, bot started / activated / deactivated / auto-stopped, failed orders, rejected capital increases;
+    tightening, bot started / activated / deactivated / auto-stopped, failed orders (BUY / SELL with the Binance API error reason), rejected capital increases;
   - the **interrupt alert** after a reconnect (see above);
   - **trades blocked by a filter** — one message per bar listing each blocked signal and why (C quality gate, score below
     the regime minimum, strategy degraded, stop-band / cost gates, slot taken by a better candidate, cooldown, drawdown

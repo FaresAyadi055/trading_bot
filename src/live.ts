@@ -26,8 +26,8 @@ const alertedAt = new Map<string, number>()
 const ALERT_EVERY_MS = 30 * 60_000
 const errText = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
-/** Record a failed order: event + (rate-limited) Telegram alert. Back-off applies to sells only. */
-function failure(botId: string, what: string, symbol: string, e: unknown, now: number, backoffMs = 0) {
+/** Record a failed order: event + (rate-limited) Telegram alert with the Binance error reason. Back-off applies to sells only. */
+function failure(botId: string, what: 'BUY' | 'SELL', symbol: string, e: unknown, now: number, backoffMs = 0) {
   const bot = getBot(botId)
   if (!bot) return
   if (backoffMs) retryAt.set(botId, now + backoffMs)
@@ -36,7 +36,7 @@ function failure(botId: string, what: string, symbol: string, e: unknown, now: n
   fx.events.push({ ts: now, kind: 'exec_failed', symbol, detail: `${what} ${symbol}: ${errText(e)}`.slice(0, 500) })
   if (now - (alertedAt.get(key) ?? 0) > ALERT_EVERY_MS) {
     alertedAt.set(key, now)
-    fx.notes.push({ kind: 'lifecycle', text: M.msgLifecycle('❗', `ORDER FAILED (${what})`, bot, `${symbol}\n${errText(e).slice(0, 300)}${backoffMs ? '\nThe sell is retried automatically.' : ''}`) })
+    fx.notes.push({ kind: 'lifecycle', text: M.msgOrderFailed(bot, what, symbol, errText(e), backoffMs > 0) })
   }
   tx(() => writeFx(botId, fx))
   console.error(`[live] bot ${botId} ${what} ${symbol} failed:`, errText(e))

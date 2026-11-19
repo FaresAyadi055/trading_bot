@@ -28,6 +28,10 @@ export const msgSell = (b: BotRow, symbol: string, s: Strat, price: number, qty:
 export const msgTighten = (b: BotRow, symbol: string, s: Strat, stop: number, t: number) =>
   `${head('🛡️', 'STOP TIGHTENED (volatility kill switch)', b)}\n${symbol} · strategy ${strat(s)} · new stop ${px(stop)}\nBar ${barLabel(t)}`
 
+/** A live BUY/SELL rejected by the Binance API: always names the side, the symbol and the API's reason. */
+export const msgOrderFailed = (b: Pick<BotRow, 'id' | 'name'>, side: 'BUY' | 'SELL', symbol: string, reason: string, retrying: boolean) =>
+  `${head('❗', `ORDER FAILED (${side})`, b)}\n${side} ${symbol}\nBinance API error: ${reason.slice(0, 300)}${retrying ? '\nThe sell is retried automatically.' : ''}`
+
 const REASON_TEXT: Record<string, string> = {
   c_quality_gate: 'C quality gate', score_below_min: 'score below regime minimum', strategy_degraded: 'strategy degraded',
   stop_band: 'stop-band gate', cost_gate: 'cost gate', edge_gate: 'edge gate', slot_taken: 'slot taken by a better candidate',

@@ -126,6 +126,31 @@ test('live entry: a failed buy is dropped and never retried; stale entries expir
   expect(ex.calls.filter((c: any) => c.op === 'buy').length).toBe(1)
 })
 
+test('live failure: rejected BUY / SELL queue a Telegram alert with the Binance error reason', async () => {
+  const buyBot = await create(500)
+  pendingEntry(buyBot.id)
+  ex.failNext.push({ op: 'buy', err: new Error('insufficient balance (code -2010)') })
+  await m.live.executeBot(buyBot.id, T())                                       // BUY fails: entry is dropped, no retry
+  const buyNote = m.db.query("SELECT text FROM notifications WHERE kind='lifecycle' ORDER BY id DESC LIMIT 1").get() as any
+  expect(buyNote.text).toContain('ORDER FAILED (BUY)')
+  expect(buyNote.text).toContain('BTCUSDT')
+  expect(buyNote.text).toContain('insufficient balance (code -2010)')
+
+  const sellBot = await create(500)
+  pendingEntry(sellBot.id)
+  await m.live.executeBot(sellBot.id, T())                                       // real (mock) fill, then force a failed exit
+  const { st, last } = m.bots.loadState(sellBot.id)
+  st.exitNow = { reason: 'KILL', bar: 1, t: 1 }; m.bots.saveState(sellBot.id, st, last)
+  ex.failNext.push({ op: 'sell', err: new Error('market closed (code -1013)') })
+  await m.live.executeBot(sellBot.id, T())
+  const sellNote = m.db.query("SELECT text FROM notifications WHERE kind='lifecycle' ORDER BY id DESC LIMIT 1").get() as any
+  expect(sellNote.text).toContain('ORDER FAILED (SELL)')
+  expect(sellNote.text).toContain('BTCUSDT')
+  expect(sellNote.text).toContain('market closed (code -1013)')
+  expect(sellNote.text).toContain('retried automatically')
+  expect(m.bots.loadState(sellBot.id).st.position).not.toBeNull()                // the position is kept until the retry succeeds
+})
+
 test('stop monitor: C stop and hard stop sell at market and book real P/L; other bots untouched', async () => {
   const bot = await create(1000)
   pendingEntry(bot.id)
