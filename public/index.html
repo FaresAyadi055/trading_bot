@@ -60,7 +60,10 @@ async function api(method,path,body){
   const r=await fetch('/api'+path,{method,headers:{authorization:'Bearer '+token,'content-type':'application/json'},body:body?JSON.stringify(body):undefined});
   if(r.status===401){localStorage.removeItem('tb_token');token='';render();throw new Error('unauthorized')}
   const j=await r.json().catch(()=>null);
-  if(!r.ok)throw new Error(j?.error||('HTTP '+r.status));
+  if(!r.ok){
+    const issues=Array.isArray(j?.issues)?j.issues.map(x=>x?.path?`${x.path}: ${x.message}`:x?.message).filter(Boolean):[];
+    throw new Error(issues.length?`${j?.error||'error'}: ${issues.join('; ')}`:(j?.error||('HTTP '+r.status)));
+  }
   return j;
 }
 // Live prices come straight from Binance (never proxied through the Hono server).
@@ -234,7 +237,7 @@ async function initPicker(sel){
   dlg.querySelector('#ap').onclick=(e)=>{const t=e.target.closest('[data-pk]');if(!t)return;e.preventDefault();e.stopPropagation();toggle(t.dataset.pk)};
 }
 function modal(html,onOk,okText='Save',after){
-  dlg.innerHTML=`<form method="dialog">${html}<div class="row" style="margin-top:16px;justify-content:flex-end"><button value="x">Cancel</button><button class="pri" id="ok" value="y">${okText}</button></div><div id="merr" class="dn" style="margin-top:8px"></div></form>`;
+  dlg.innerHTML=`<form method="dialog">${html}<div class="row" style="margin-top:16px;justify-content:flex-end"><button value="x" formnovalidate>Cancel</button><button class="pri" id="ok" value="y">${okText}</button></div><div id="merr" class="dn" style="margin-top:8px"></div></form>`;
   dlg.showModal();if(after)after();
   dlg.querySelector('#ok').onclick=async(e)=>{e.preventDefault();try{await onOk();dlg.close();refresh()}catch(x){dlg.querySelector('#merr').textContent=x.message}};
 }
@@ -247,12 +250,12 @@ document.addEventListener('click',async(e)=>{
   const {act,id,type}=t.dataset,b=bots.find(x=>x.id===id);
   try{
     if(act==='logout'){localStorage.removeItem('tb_token');token='';render()}
-    else if(act==='create')modal(`<h3 style="margin-top:0">New bot</h3><label>Name (optional)</label><input id="n" style="width:100%"><label>Trading assets — any Binance USDT pair (one trade at a time, best signal across them wins)</label>${assetPicker()}<label>Capital (USDT)${room()}</label><input id="c" type="number" min="1" value="1000" style="width:100%">`,
+    else if(act==='create')modal(`<h3 style="margin-top:0">New bot</h3><label>Name (optional)</label><input id="n" style="width:100%"><label>Trading assets — any Binance USDT pair (one trade at a time, best signal across them wins)</label>${assetPicker()}<label>Capital (USDT)${room()}</label><input id="c" type="number" min="1" step="0.01" inputmode="decimal" value="1000" style="width:100%">`,
       ()=>api('POST','/bots',{name:dlg.querySelector('#n').value||undefined,assets:picked(),capital:+dlg.querySelector('#c').value}),'Create',()=>initPicker(['BTCUSDT']));
     else if(act==='activate'){await api('POST','/bots/'+id+'/activate');refresh()}
     else if(act==='deactivate')modal(`<h3 style="margin-top:0">Deactivate ${esc(b.name)}</h3><label>When</label><select id="w" style="width:100%"><option value="after_exit">After the current trade exits${b.position?'':' (flat → immediate)'}</option><option value="now">Now (closes any open position at market)</option></select>`,
       ()=>api('POST','/bots/'+id+'/deactivate',{when:dlg.querySelector('#w').value}),'Deactivate');
-    else if(act==='edit')modal(`<h3 style="margin-top:0">Edit ${esc(b.name)}</h3><label>Name</label><input id="n" value="${esc(b.name)}" style="width:100%"><label>Trading assets</label>${assetPicker()}<label>If the open trade's asset is removed</label><select id="w" style="width:100%"><option value="after_exit">Wait for the trade to exit</option><option value="now">Close it now</option></select><label>Capital base (USDT) — applied when flat; an increase must fit the unallocated capital${room()}</label><input id="c" type="number" min="1" value="${b.initialCapital}" style="width:100%">`,
+    else if(act==='edit')modal(`<h3 style="margin-top:0">Edit ${esc(b.name)}</h3><label>Name</label><input id="n" value="${esc(b.name)}" style="width:100%"><label>Trading assets</label>${assetPicker()}<label>If the open trade's asset is removed</label><select id="w" style="width:100%"><option value="after_exit">Wait for the trade to exit</option><option value="now">Close it now</option></select><label>Capital base (USDT) — applied when flat; an increase must fit the unallocated capital${room()}</label><input id="c" type="number" min="1" step="0.01" inputmode="decimal" value="${b.initialCapital}" style="width:100%">`,
       ()=>{const body={name:dlg.querySelector('#n').value,when:dlg.querySelector('#w').value};const a=picked();if(a.join()!==b.assets.join())body.assets=a;const c=+dlg.querySelector('#c').value;if(c!==b.initialCapital)body.capital=c;return api('PATCH','/bots/'+id,body)},'Save',()=>initPicker(b.assets));
     else if(act==='delete')modal(`<h3 style="margin-top:0">Delete ${esc(b.name)}?</h3><p class="mut">All of its data (portfolio, logs, state) is removed permanently.</p><label>When</label><select id="w" style="width:100%"><option value="after_exit">After the current trade exits</option><option value="now">Now</option></select>`,
       ()=>api('DELETE','/bots/'+id+'?when='+dlg.querySelector('#w').value),'Delete');
