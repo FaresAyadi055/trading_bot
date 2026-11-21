@@ -11,6 +11,7 @@ import { processAll, upsertCandles } from './runner'
 import { flushNotifications, notifyApiFailure } from './notify'
 import { rt } from './runtime'
 import { getExchange, addPaperCapital } from './exchange'
+import { startTunnel, stopTunnel } from './tunnel'
 import { fetchFree, resetCapitalCache, snapshot } from './capital'
 import { closeBotNow, executeAll, monitorTick } from './live'
 import * as M from './messages'
@@ -261,5 +262,15 @@ if (!process.env.NO_WORKER) {
   console.log(`[boot] MODE=${config.mode} exchange=${getExchange().name} execution=${config.executionBase} data=${config.dataBase}`)
 }
 
-export default { port: config.port, fetch: app.fetch, idleTimeout: 30 }
+// TUNNEL=true: start the temporary Cloudflare tunnel with the app and announce its URL once connected.
+// Not tied to the worker, so the dashboard/tunnel also work with NO_WORKER=1.
+if (config.tunnel && import.meta.main) {
+  startTunnel()
+  const shutdown = () => { stopTunnel(); process.exit(0) }
+  process.once('SIGINT', shutdown)
+  process.once('SIGTERM', shutdown)
+  process.once('exit', stopTunnel)
+}
+
+export default { port: config.port, hostname: config.host, fetch: app.fetch, idleTimeout: 30 }
 export { app, getBot }

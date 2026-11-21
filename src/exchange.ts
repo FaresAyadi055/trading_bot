@@ -238,11 +238,25 @@ export class SpotExchange implements Exchange {
     }
   }
 
+  /**
+   * `GET /api/v3/order` has no `fills` array, so a filled resting stop would otherwise book a zero
+   * fee. Read the actual commissions from `myTrades` (one extra request only when a stop fills).
+   */
+  private async fillsForOrder(symbol: string, orderId: string): Promise<any[]> {
+    try {
+      const r = await this.c.call('GET', '/api/v3/myTrades', { symbol, orderId, limit: 1000 })
+      return Array.isArray(r) ? r : []
+    } catch {
+      return [] // best effort: booking the fill without the fee is better than not booking it
+    }
+  }
+
   async orderStatus(symbol: string, orderRef: string): Promise<OrderState> {
     const r = await this.c.call('GET', '/api/v3/order', { symbol, orderId: orderRef })
     const status = String(r.status ?? 'UNKNOWN')
     if (status === 'FILLED') {
-      try { return { status, fill: this.parse(r) } } catch { return { status, fill: null } }
+      const fills = await this.fillsForOrder(symbol, orderRef)
+      try { return { status, fill: this.parse({ ...r, symbol, fills }) } } catch { return { status, fill: null } }
     }
     return { status, fill: null }
   }

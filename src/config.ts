@@ -21,7 +21,12 @@ if (!exchangeOptional && (!apiKey || !apiSecret)) throw new Error(`BINANCE_API_K
 
 const strip = (u: string) => u.replace(/\/$/, '')
 const num = (v: string | undefined, d: number) => (v !== undefined && v !== '' && Number.isFinite(Number(v)) ? Number(v) : d)
+const flag = (v: string | undefined) => /^(1|true|yes|on)$/i.test((v ?? '').trim())
 const binanceBase = strip(process.env.BINANCE_BASE_URL ?? 'https://api.binance.com')
+
+// Cloudflare Tunnel. TUNNEL=true is the only setting needed: the app starts a temporary quick
+// tunnel on boot (src/tunnel.ts) and sends its URL to Telegram. Unit tests never start it.
+const tunnel = process.env.NODE_ENV !== 'test' && flag(process.env.TUNNEL)
 
 // Paper mode always works on a copy under data-test/. `DB_PATH` is the live database (also the copy source);
 // `TEST_DB_PATH` can override the paper file, and `:memory:` is kept for tests.
@@ -32,6 +37,8 @@ const dbPath = memoryDb ? ':memory:' : mode === 'test' ? (process.env.TEST_DB_PA
 export const config = {
   mode,
   port: Number(process.env.PORT ?? 3000),
+  /** Bind address. Loopback by default; set HOST=0.0.0.0 only for a trusted LAN / container. */
+  host: process.env.HOST?.trim() || '127.0.0.1',
   /** Paper mode never touches the live books: it works on its own copy under `data-test/`. */
   dbPath,
   /** The live database path, even in test mode (where `dbPath` points at the copy). */
@@ -60,9 +67,20 @@ export const config = {
   /** Cache lifetime of the account balance snapshot used by the capital ledger. */
   balanceTtlMs: Math.max(0, num(process.env.BALANCE_TTL_SECONDS, 10)) * 1000,
 
+  // ---- Cloudflare Tunnel (src/tunnel.ts) ----
+  /** Start the tunnel on boot. The only tunnel setting that normally needs to be set. */
+  tunnel,
+  /** Quick tunnel (temporary https://<random>.trycloudflare.com) is the default; false = named tunnel. */
+  tunnelQuick: process.env.TUNNEL_QUICK === undefined ? true : flag(process.env.TUNNEL_QUICK),
+  /** Send the public URL to Telegram once the tunnel is up. */
+  tunnelNotify: process.env.TUNNEL_NOTIFY === undefined ? true : flag(process.env.TUNNEL_NOTIFY),
+  /** Named-tunnel ingress config (only used when TUNNEL_QUICK=false). */
+  tunnelConfig: process.env.TUNNEL_CONFIG?.trim() || 'deploy/cloudflared.yml',
+  cloudflaredBin: process.env.CLOUDFLARED_BIN?.trim() || 'cloudflared',
+
   // ---- HTTP hardening (src/security.ts) ----
-  /** Honour X-Forwarded-* / CF-Connecting-IP (set behind Cloudflare Tunnel or another reverse proxy). */
-  trustProxy: process.env.TRUST_PROXY === '1',
+  /** Honour X-Forwarded-* / CF-Connecting-IP. Defaults to on with the tunnel, off otherwise. */
+  trustProxy: process.env.TRUST_PROXY !== undefined ? process.env.TRUST_PROXY === '1' : tunnel,
   /** Refuse plaintext API traffic. Default on; set FORCE_HTTPS=0 only on a trusted LAN. */
   forceHttps: process.env.FORCE_HTTPS !== '0',
   /** Optional separate key for signing session cookies (defaults to the access token). */

@@ -174,7 +174,11 @@ function applyOne(bot: BotRow, a: PendingAction, now: number) {
       break
     case 'set_capital': {
       const delta = a.capital - bot.initial_capital
-      if (bot.cash + delta <= 0) { ev.push({ ts: now, kind: 'capital_rejected', symbol: null, detail: 'would make cash non-positive' }); break }
+      if (bot.cash + delta <= 0) {
+        ev.push({ ts: now, kind: 'capital_rejected', symbol: null, detail: 'would make cash non-positive' })
+        fx.notes.push({ kind: 'lifecycle', text: M.msgLifecycle('🚫', 'CAPITAL DECREASE REJECTED', bot, 'would make cash non-positive') })
+        break
+      }
       if (rt.live && delta > 0) { // growing a bot claims more of the account: it must fit into the unallocated capital right now
         const free = recentFree(120_000)
         try { if (free === null) throw new HttpError(503, 'account balance unavailable'); assertAllocatable(free, delta, `capital increase of ${bot.name}`) }
@@ -261,7 +265,11 @@ export function updateBot(id: string, u: UpdateInput, free?: number) {
     const locked = lockedSymbol(loadState(id).st)
     if (u.capital != null) {
       if (locked) addPending(bot, { type: 'set_capital', capital: u.capital, requestedAt: Date.now() }) // never mid-trade
-      else applyOne(bot, { type: 'set_capital', capital: u.capital, requestedAt: Date.now() }, Date.now())
+      else {
+        // Fail the request instead of silently ignoring a decrease that the current cash cannot absorb.
+        if (bot.cash + (u.capital - bot.initial_capital) <= 0) throw new HttpError(409, 'capital would make cash non-positive')
+        applyOne(bot, { type: 'set_capital', capital: u.capital, requestedAt: Date.now() }, Date.now())
+      }
     }
     saveBot(bot)
   })

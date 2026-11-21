@@ -82,13 +82,16 @@ async function ticker24h(): Promise<Map<string, { quoteVolume: number }>> {
   return new Map(rows.map((r) => [r.symbol, { quoteVolume: Number(r.quoteVolume) }]))
 }
 
+/** Binance klines request weight by `limit`: 1–100 → 1, 101–500 → 2, 501–1000 → 5, 1001–1500 → 10. */
+const klineWeight = (limit: number) => (limit <= 100 ? 1 : limit <= 500 ? 2 : limit <= 1000 ? 5 : 10)
+
 /** Klines. `since` null = newest `bars` candles; otherwise only the missing tail. */
 async function klines(symbol: string, since: number | null, bars = 1000): Promise<Candle[]> {
   const now = Date.now()
   const stale = since == null || (now - since) / BAR_MS > 990
   const limit = stale ? bars : Math.min(bars, Math.max(2, Math.ceil((now - since) / BAR_MS) + 2))
   const url = `${base}/api/v3/klines?symbol=${symbol}&interval=4h&limit=${limit}${stale ? '' : `&startTime=${since}`}`
-  const rows = (await getJson(url, stale ? 2 : 1)) as any[][]
+  const rows = (await getJson(url, klineWeight(limit))) as any[][]
   return rows.filter((r) => Number(r[6]) < now).map((r) => ({ t: Number(r[0]), o: +r[1], h: +r[2], l: +r[3], c: +r[4], v: +r[5] }))
 }
 

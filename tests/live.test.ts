@@ -174,6 +174,40 @@ test('stop monitor: resting hard stop fills on the exchange and books real P/L; 
   expect(ex.free.BTC).toBeCloseTo(0, 8)
 })
 
+test('stop monitor: a bar committed while a stop call is in flight is not overwritten', async () => {
+  const bot = await create(1000)
+  pendingEntry(bot.id)
+  await m.live.executeBot(bot.id, T())
+  const { st: s0, last } = m.bots.loadState(bot.id)
+  s0.position!.restingStop = s0.position!.stopOrderPlaced! * 1.01 // force a cancel + replace
+  m.bots.saveState(bot.id, s0, last)
+
+  const orig = ex.orderStatus.bind(ex)
+  let release!: () => void
+  const gate = new Promise<void>((r) => { release = r })
+  let gated = false
+  ex.orderStatus = async (...args: any[]) => {
+    if (!gated) { gated = true; await gate }
+    return orig(...args)
+  }
+  try {
+    const p = m.live.executeBot(bot.id, T())
+    await Bun.sleep(10)
+    // the runner commits a new bar while the exchange call is in flight
+    const { st, last: l2 } = m.bots.loadState(bot.id)
+    st.position!.barsHeld = 42
+    st.exitNow = { reason: 'TIME', bar: 1, t: 1 }
+    m.bots.saveState(bot.id, st, l2)
+    release()
+    await p
+  } finally { ex.orderStatus = orig }
+
+  const after = m.bots.loadState(bot.id)
+  expect(after.st.position!.barsHeld).toBe(42)   // the in-flight stop write did not resurrect stale state
+  expect(after.st.exitNow?.reason).toBe('TIME')
+  expect(after.st.position!.stopOrderId).toBeTruthy()
+})
+
 test('sell failure keeps the position, retries with back-off and eventually books', async () => {
   const bot = await create(1000)
   pendingEntry(bot.id)
@@ -219,7 +253,7 @@ test('no replay: stale bars are skipped, time-based state advances, nothing is t
   expect(skipped).toBe(expected)
   expect(after.st.counters.skipped_bars).toBe(expected)
   expect(after.st.position.barsHeld).toBe(5 + expected)
-  expect(after.st.cooldown).toBe(0)
+  expect(after.st.cooldown).toBe(Math.max(0, 10 - expected)) // the cooldown ticks down with the skipped bars
   expect(after.last).toBe(lastClosed - (fresh ? BAR : 0))
   expect((m.db.query("SELECT COUNT(*) c FROM notifications WHERE kind IN ('interrupt','api_error')").get() as any).c).toBe(0) // no connectivity alert
   expect(m.db.query("SELECT COUNT(*) c FROM transactions WHERE bot_id=?").get(bot.id)).toEqual({ c: 0 }) // nothing was traded by the skipped bars

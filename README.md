@@ -97,12 +97,23 @@ also has **+ add test capital** to credit fake USDT. Per bot: equity / P/L, posi
 protections, analytics and the transaction log.
 
 ## Security
-- Plaintext API traffic is refused (`FORCE_HTTPS`, loopback exempt) and page requests redirect to HTTPS. Behind
-  Cloudflare Tunnel set `TRUST_PROXY=1` so the forwarded scheme/host and client IP are trusted.
+- Plaintext API traffic is refused (`FORCE_HTTPS`, loopback exempt) and page requests redirect to HTTPS.
+  `TRUST_PROXY` defaults to on while `TUNNEL=true`, so the forwarded scheme/host and client IP are trusted.
 - The access token is exchanged for a signed, HttpOnly, Secure, SameSite=Strict session cookie; scripts can keep using
   `Authorization: Bearer <token>`.
 - Per-IP failed-auth lockout and a per-IP API request budget. Security headers (CSP, HSTS, nosniff, frame deny) are set
   on every response.
+
+### Cloudflare Tunnel
+1. In `.env`: `TUNNEL=true`. That is the only setting needed — on boot the app starts a temporary
+   `https://<random>.trycloudflare.com` quick tunnel and sends the URL to Telegram (`TRUST_PROXY` defaults to 1
+   while the tunnel is on; `HOST` stays `127.0.0.1`).
+2. Start the app (`bun run start` or `bun run dev`); the tunnel starts with it. `TUNNEL=false` disables it.
+3. The tunnel forwards to `http://127.0.0.1:3000`. A quick tunnel's URL changes on every run and has no uptime
+   guarantee. For a stable hostname: `cp deploy/cloudflared.yml.example deploy/cloudflared.yml`, fill in the tunnel
+   UUID / hostname, then set `TUNNEL_QUICK=false`.
+4. `TUNNEL_NOTIFY=false` keeps the tunnel but skips the Telegram message. `bun run tunnel` runs the tunnel
+   standalone (without the app); do not use it while the app already runs with `TUNNEL=true`.
 
 ## Configuration (`.env`)
 | Variable | Default | |
@@ -111,6 +122,7 @@ protections, analytics and the transaction log.
 | `MODE` | — | **required**: `live` (spot, real funds) or `test` (paper trading) |
 | `BINANCE_API_KEY`, `BINANCE_API_SECRET` | — | **required in live mode**; spot key, no withdrawals. Ignored in test mode |
 | `PORT` | 3000 | |
+| `HOST` | `127.0.0.1` | bind address; set `0.0.0.0` only for a trusted LAN / container |
 | `DB_PATH` | `data/trading.sqlite` | live database; in test mode it is the copy source (the paper DB is always separate) |
 | `PAPER_START_USDT` | 10000 | fake USDT seeded into a new paper account (test mode) |
 | `TEST_DB_PATH` | `data-test/trading.sqlite` | paper database file (test mode) |
@@ -122,7 +134,12 @@ protections, analytics and the transaction log.
 | `STOP_POLL_SECONDS` | 15 | resting-stop reconciliation + backstop period (min 5) |
 | `MAX_ENTRY_SLIPPAGE_PCT` | 1 | refuse a buy priced more than this above the reference |
 | `BALANCE_TTL_SECONDS` | 10 | balance cache for the dashboard / ledger view |
-| `TRUST_PROXY` | 0 | honour `X-Forwarded-*` / `CF-Connecting-IP` (Cloudflare Tunnel / reverse proxy) |
+| `TRUST_PROXY` | `1` with `TUNNEL=true`, else `0` | honour `X-Forwarded-*` / `CF-Connecting-IP` |
+| `TUNNEL` | false | `true` = start a temporary Cloudflare tunnel on boot and send its URL to Telegram |
+| `TUNNEL_QUICK` | true | `false` = use a named tunnel (`TUNNEL_CONFIG`) instead of the temporary URL |
+| `TUNNEL_NOTIFY` | true | send the tunnel's public URL to Telegram once it is up |
+| `TUNNEL_CONFIG` | `deploy/cloudflared.yml` | cloudflared ingress config file |
+| `CLOUDFLARED_BIN` | `cloudflared` | cloudflared binary name or absolute path |
 | `FORCE_HTTPS` | 1 | set `0` only on a trusted LAN |
 | `SESSION_SECRET` | access token | optional separate key for session cookies |
 | `SESSION_TTL_SECONDS` | 43200 | session cookie lifetime |
@@ -147,5 +164,5 @@ credentials are absent. `MODE=test` never reads `BINANCE_API_KEY` / `BINANCE_API
   position stays managed (the sell is retried automatically).
 
 ## Documentation
-`AGENT.md` architecture and remaining tasks · `schema.sql` locked DB schema (v4) · `openapi.yml` HTTP API ·
+`AGENT.md` architecture and remaining tasks · `schema.sql` locked DB schema (v5) · `openapi.yml` HTTP API ·
 `bot/BOT_SPEC.md` strategy and universe specification.

@@ -15,6 +15,7 @@ process.env.API_RATE_LIMIT_MAX = '1000'
 process.env.API_RATE_LIMIT_WINDOW_SECONDS = '60'
 
 const { app } = await import('../src/index')
+const { config } = await import('../src/config')
 
 const https = (path: string, init?: RequestInit) => app.request('https://bot.example.com' + path, init)
 const http = (path: string, init?: RequestInit) => app.request('http://bot.example.com' + path, init)
@@ -92,12 +93,41 @@ describe('session cookie', () => {
     const r = await https('/api/status', { headers: ip(8) })
     expect(r.status).toBe(401)
   })
+
+  test('a non-string token is a normal 401, not a 500', async () => {
+    const tokens = [123, null, {}, ['x']]
+    for (let i = 0; i < tokens.length; i++) {
+      const r = await https('/api/session', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...ip(10 + i) },
+        body: JSON.stringify({ token: tokens[i] }),
+      })
+      expect(r.status).toBe(401)
+    }
+  })
+})
+
+describe('rate limiter', () => {
+  test('a lockout survives a window rollover (block may outlive the counting window)', async () => {
+    const { RateLimiter } = await import('../src/security')
+    const rl = new RateLimiter(1_000, 2, 5_000)
+    expect(rl.take('k', 0).allowed).toBe(true)
+    expect(rl.take('k', 1).allowed).toBe(true)
+    const blocked = rl.take('k', 2)
+    expect(blocked.allowed).toBe(false)
+    expect(blocked.retryAfter).toBe(5)
+    expect(rl.take('k', 1_500).allowed).toBe(false) // the window rolled over, the block did not
+    expect(rl.blocked('k', 1_500).blocked).toBe(true)
+    expect(rl.take('k', 5_002).allowed).toBe(true) // block expired: a new budget starts
+  })
 })
 
 describe('rate limiting', () => {
   test('failed logins are blocked after the configured budget', async () => {
     const headers = { authorization: 'Bearer wrong', ...ip(9) }
-    for (let i = 0; i < 3; i++) expect((await https('/api/status', { headers })).status).toBe(401)
+    // `bun test` shares the module cache between files, so read the limit that was actually configured
+    // (this file's env is only applied when it is the first to import config).
+    for (let i = 0; i < config.authRateLimitMax; i++) expect((await https('/api/status', { headers })).status).toBe(401)
     const blocked = await https('/api/status', { headers })
     expect(blocked.status).toBe(429)
     expect(Number(blocked.headers.get('retry-after'))).toBeGreaterThan(0)

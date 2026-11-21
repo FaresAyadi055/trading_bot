@@ -134,47 +134,64 @@ async function ensureStop(botId: string, st: NonNullable<ReturnType<typeof loadS
   const pos = st.position
   if (!pos) return
   const ex = getExchange()
+  const symbol = pos.symbol
+  const entryTs = pos.entryTs
+  // Work on locals and write back only the stop fields at the end: exchange calls await, and the
+  // runner may commit a new bar in the meantime. Saving this stale `st` would erase that bar's work.
+  let stopOrderId = pos.stopOrderId ?? null
+  let stopOrderPlaced = pos.stopOrderPlaced
 
-  if (pos.stopOrderId) {
+  if (stopOrderId) {
     let s: OrderState | null = null
-    try { s = await ex.orderStatus(pos.symbol, pos.stopOrderId) }
-    catch { pos.stopOrderId = null; pos.stopOrderPlaced = undefined } // unknown / cancelled: recreate below
+    try { s = await ex.orderStatus(symbol, stopOrderId) }
+    catch { stopOrderId = null; stopOrderPlaced = undefined } // unknown / cancelled: recreate below
     if (s) {
       if (s.status === 'FILLED') { if (s.fill) await bookStopFill(botId, now, s.fill); return }
-      if (['CANCELED', 'EXPIRED', 'EXPIRED_IN_MATCH', 'REJECTED'].includes(s.status)) { pos.stopOrderId = null; pos.stopOrderPlaced = undefined }
+      if (['CANCELED', 'EXPIRED', 'EXPIRED_IN_MATCH', 'REJECTED'].includes(s.status)) { stopOrderId = null; stopOrderPlaced = undefined }
     }
   }
 
   const desired = pos.restingStop
   if (!(desired > 0)) return
-  const placed = pos.stopOrderPlaced
-  if (pos.stopOrderId && placed != null && desired <= placed * 1.0005) return // already at (or above) the level
-  if (pos.stopOrderId) {
-    try { await ex.cancelOrder(pos.symbol, pos.stopOrderId) }
+  if (stopOrderId && stopOrderPlaced != null && desired <= stopOrderPlaced * 1.0005) return // already at (or above) the level
+  if (stopOrderId) {
+    try { await ex.cancelOrder(symbol, stopOrderId) }
     catch (e) {
-      const s = await ex.orderStatus(pos.symbol, pos.stopOrderId).catch(() => null)
+      const s = await ex.orderStatus(symbol, stopOrderId).catch(() => null)
       if (s?.status === 'FILLED' && s.fill) { await bookStopFill(botId, now, s.fill); return }
       throw e
     }
-    pos.stopOrderId = null
+    stopOrderId = null
+    stopOrderPlaced = undefined
   }
 
+  let failed: unknown = null
   try {
-    const o = await ex.placeStop(pos.symbol, pos.qty, desired, { clientId: `tb${botId}s${now.toString(36)}` })
-    pos.stopOrderId = o.orderRef
-    pos.stopOrderPlaced = o.stopPrice
+    const o = await ex.placeStop(symbol, pos.qty, desired, { clientId: `tb${botId}s${now.toString(36)}` })
+    stopOrderId = o.orderRef
+    stopOrderPlaced = o.stopPrice
     const fx = newFx()
-    fx.events.push({ ts: now, kind: 'stop_placed', symbol: pos.symbol, detail: `${o.type} @ ${o.stopPrice} qty ${o.qty}` })
+    fx.events.push({ ts: now, kind: 'stop_placed', symbol, detail: `${o.type} @ ${o.stopPrice} qty ${o.qty}` })
     tx(() => writeFx(botId, fx))
   } catch (e) {
     // keep the position: the monitor sells at market if price reaches the stop
-    pos.stopOrderId = null
-    pos.stopOrderPlaced = undefined
-    failure(botId, 'STOP', pos.symbol, e, now)
-    return
+    stopOrderId = null
+    stopOrderPlaced = undefined
+    failed = e
   }
-  const { last } = loadState(botId)
-  tx(() => saveState(botId, st, last))
+
+  const { st: cur, last } = loadState(botId)
+  const p = cur.position
+  if (!p || p.symbol !== symbol || p.entryTs !== entryTs) {
+    // The position was closed / replaced while the order was in flight: never resurrect it, and do
+    // not leave a stop that would sell an asset the bot no longer holds.
+    if (stopOrderId) await ex.cancelOrder(symbol, stopOrderId).catch(() => {})
+  } else {
+    p.stopOrderId = stopOrderId
+    p.stopOrderPlaced = stopOrderPlaced
+    tx(() => saveState(botId, cur, last))
+  }
+  if (failed) failure(botId, 'STOP', symbol, failed, now)
 }
 
 async function buyIn(botId: string, now: number) {
@@ -259,16 +276,20 @@ export async function monitorTick(now = Date.now()) {
       return
     }
     for (const { id, st } of live) {
-      const pos = st.position!
-      const px = prices[pos.symbol]
-      if (!(px > 0)) continue
+      const seen = st.position!
+      const px = prices[seen.symbol]
+      if (!(px > 0) || !(px <= seen.restingStop)) continue
+      if (busy.has(id)) continue // an order is already in flight for this bot
+      // Re-read right before writing: the runner may have processed a bar while prices were fetched.
+      const { st: cur, last } = loadState(id)
+      const pos = cur.position
+      if (!pos || pos.symbol !== seen.symbol || pos.entryTs !== seen.entryTs || cur.exitNow) continue
       if (!(px <= pos.restingStop)) continue
-      const { last } = loadState(id)
       const t = barOpen(now)
-      st.exitNow = { reason: pos.ratcheted ? 'STOP' : 'HARD_STOP', bar: barIndex(t), t }
+      cur.exitNow = { reason: pos.ratcheted ? 'STOP' : 'HARD_STOP', bar: barIndex(t), t }
       const fx = newFx()
       fx.events.push({ ts: now, kind: 'exit_triggered', symbol: pos.symbol, detail: `price ${px} <= resting stop ${pos.restingStop}` })
-      tx(() => { saveState(id, st, last); writeFx(id, fx) }) // persist the intent BEFORE the order: a crash cannot lose it
+      tx(() => { saveState(id, cur, last); writeFx(id, fx) }) // persist the intent BEFORE the order: a crash cannot lose it
       await executeBot(id, now).catch((e) => console.error('[live] stop sell', id, e))
     }
   } finally { monitoring = false }

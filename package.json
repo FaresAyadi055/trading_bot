@@ -5,6 +5,7 @@
     "start": "bun run src/index.ts",
     "test": "bun test",
     "smoke": "bun tests/smoke.ts",
+    "tunnel": "bun run scripts/tunnel.ts",
     "parity": "bun tests/parity/parity.ts"
   },
   "dependencies": {

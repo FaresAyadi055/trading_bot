@@ -1,13 +1,16 @@
-# Cloudflare Tunnel configuration for the trading bot dashboard.
+# Cloudflare Tunnel configuration — ADVANCED (named tunnel with a stable hostname).
 #
+# The default is a temporary quick tunnel: just set TUNNEL=true in .env and start the app.
+# To use this file instead:
 #   cp deploy/cloudflared.yml.example deploy/cloudflared.yml
-#   # fill in the tunnel UUID and the public hostname, then:
-#   bun run tunnel
+#   # fill in the tunnel UUID and the public hostname
+#   # .env: TUNNEL=true and TUNNEL_QUICK=false
+#   bun run start          # the app starts the tunnel and sends its URL to Telegram
 #
-# The app itself should bind to loopback (`HOST=127.0.0.1`) and trust the proxy headers
-# (`TRUST_PROXY=1 FORCE_HTTPS=1`). Cloudflare terminates TLS at the edge and connects to
-# cloudflared over an outbound TLS connection, so the access token never crosses the network
-# in plaintext.
+# TRUST_PROXY defaults to 1 while TUNNEL=true, so the forwarded scheme/client IP are trusted.
+# The app binds to loopback (`HOST=127.0.0.1`); Cloudflare terminates TLS at the edge and
+# connects to cloudflared over an outbound TLS connection, so the access token never crosses
+# the network in plaintext.
 #
 # `deploy/cloudflared.yml` is gitignored because it references the tunnel credentials.
 

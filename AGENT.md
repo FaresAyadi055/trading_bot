@@ -10,6 +10,7 @@ cp .env.example .env     # set ACCESS_TOKEN, MODE=live|test; live also needs BIN
 bun run dev              # http://localhost:3000/bot  (hot reload; dashboard also at /bot/dashboard)
 bun test                 # unit + lifecycle + notification + migration + capital + live-execution + security tests (in-memory sqlite, MockExchange)
 bun run smoke            # end-to-end: app + worker against a mock Binance server and a mock account (no credentials needed)
+bun run tunnel           # standalone tunnel (the app starts it automatically when TUNNEL=true)
 ```
 `bun run parity` is a legacy no-op: the Python reference implements the retired A+C strategy.
 
@@ -19,6 +20,7 @@ bun run smoke            # end-to-end: app + worker against a mock Binance serve
 | Hono app | `src/index.ts` | Security middleware, REST API, streams `public/index.html`; starts the worker, syncs the pulled-symbol list after every state change. No in-memory caches. |
 | Security | `src/security.ts` | HTTPS enforcement (loopback exempt), signed HttpOnly session cookie, Bearer tokens, per-IP auth lockout + API budget, security headers. |
 | Config | `src/config.ts` | `MODE` (`live`\|`test`), keys, execution base (`BINANCE_BASE_URL`) vs data base (`BINANCE_DATA_URL`, mainnet), paper-account settings, poll / slippage / HTTP-hardening settings. Fails fast on missing `ACCESS_TOKEN` / `MODE`; API keys are required in live mode only (`NODE_ENV=test`, `NO_EXCHANGE=1` and paper mode inject a simulated exchange). |
+| Tunnel | `src/tunnel.ts` | `TUNNEL=true` starts a temporary Cloudflare quick tunnel on boot and sends the public URL to Telegram once connected. `TUNNEL_QUICK=false` uses a named tunnel (`TUNNEL_CONFIG`). `TRUST_PROXY` defaults to 1 while the tunnel is on. A tunnel failure is logged and never stops the app. |
 | Exchange | `src/exchange.ts` | `Exchange` interface (`balances`, `prices`, `buy`, `sell`, `placeStop`, `cancelOrder`, `orderStatus`, `tradable`). `SpotExchange` is the live mainnet venue: MARKET orders, LOT_SIZE rounding, client order ids, `STOP_LOSS` with a `STOP_LOSS_LIMIT` fallback; signed requests percent-encode the query *before* signing. `PaperExchange` (`MODE=test`) uses real mainnet prices but simulated fills and a fake `paper_account` balance in `data-test/`. `setExchange()` injects a mock. |
 | Paper account | `src/exchange.ts`, `data-test/trading.sqlite` | `MODE=test` copies the live DB once (`VACUUM INTO`) into `data-test/`, seeds fake USDT (`PAPER_START_USDT`, or enough to back the copied bots) plus the base assets of copied open positions, and simulates buys/sells/stops. `POST /api/paper/capital` / dashboard **+ add test capital** credits more. Live mode never reads these tables. |
 | Capital ledger | `src/capital.ts` | Real balances vs the bots' sub-allocations: `unallocated = free USDT − Σ bot cash`, `allocated = Σ(cash + position cost)`. `assertAllocatable` / `assertBacked` guard create, capital increase (request *and* apply time) and activate; `snapshot()` feeds `GET /api/capital` and detects drift (USDT and held-asset shortfalls). |

@@ -25,7 +25,7 @@ export const SESSION_COOKIE = 'tb_session'
 type Bucket = { count: number; resetAt: number; blockedUntil: number }
 
 /** Fixed-window counter with an optional lockout once the budget is exhausted. */
-class RateLimiter {
+export class RateLimiter {
   private readonly buckets = new Map<string, Bucket>()
   private ops = 0
 
@@ -45,11 +45,18 @@ class RateLimiter {
   take(key: string, now = Date.now()): { allowed: boolean; retryAfter: number } {
     this.sweep(now)
     let b = this.buckets.get(key)
-    if (!b || now >= b.resetAt) {
+    if (!b) {
       b = { count: 0, resetAt: now + this.windowMs, blockedUntil: 0 }
       this.buckets.set(key, b)
+    } else if (now >= b.resetAt) {
+      // Start a new counting window. An active lockout survives the rollover: the block may be
+      // longer than the window, and wiping it here would hand an attacker a fresh budget mid-block.
+      b.count = 0
+      b.resetAt = now + this.windowMs
+      if (b.blockedUntil <= now) b.blockedUntil = 0
     }
     if (b.blockedUntil > now) return { allowed: false, retryAfter: Math.max(1, Math.ceil((b.blockedUntil - now) / 1000)) }
+    if (b.blockedUntil) { b.blockedUntil = 0; b.count = 0 } // lockout served: start with a fresh budget
     b.count++
     if (b.count > this.max) {
       if (this.blockMs > 0) b.blockedUntil = now + this.blockMs
@@ -178,7 +185,8 @@ export const securityHeaders: MiddlewareHandler = async (c, next) => {
 
 // ---- access token + signed session cookie ---------------------------------------------------
 
-const tokenOk = (given: string): boolean => {
+const tokenOk = (given: unknown): boolean => {
+  if (typeof given !== 'string') return false
   const a = Buffer.from(given)
   const b = Buffer.from(config.accessToken)
   return a.length === b.length && timingSafeEqual(a, b)
@@ -276,12 +284,13 @@ export const authMiddleware: MiddlewareHandler<AppEnv> = async (c, next) => {
 }
 
 /** Exchange the access token for an HttpOnly session cookie. */
-export function loginWithToken(c: Context, token: string) {
+export function loginWithToken(c: Context, token: unknown) {
   const ip = clientIp(c)
   const pre = authFailures.blocked(ip)
   if (pre.blocked) return rateLimited(c, pre.retryAfter, 'auth')
 
-  if (!token || !tokenOk(token)) {
+  // A non-string token (number / null / object) is an invalid attempt, not a server error.
+  if (typeof token !== 'string' || !token || !tokenOk(token)) {
     const failure = authFailures.take(ip)
     if (!failure.allowed) return rateLimited(c, failure.retryAfter, 'auth')
     c.header('www-authenticate', 'Bearer realm="trading-bot"')
