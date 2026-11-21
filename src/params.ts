@@ -76,7 +76,7 @@ export const P = {
   // Deliberately limited to three layers: eligibility, 24h volume, and history.
   universe: {
     /** Default maximum; the live value is stored in meta.universe_max_assets and is API-editable. */
-    maxDefault: 50,
+    maxDefault: 60,
     /** Layer 2: minimum 24h quote volume (USDT). */
     volume24hMinUsd: 10_000_000,
     /** Layer 3: minimum contiguous 4h bars (matches the EMA warmup plus a buffer). */
