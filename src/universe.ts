@@ -1,5 +1,5 @@
 // Pure dynamic-universe logic. The filter is deliberately limited to three layers:
-//   1. eligibility (exchangeInfo: TRADING, USDT quote, spot, no stable/leveraged/wrapped)
+//   1. eligibility (exchangeInfo: TRADING, USDT quote, spot, no stable/fiat-pegged/gold-backed/leveraged/wrapped)
 //   2. 24h quote volume >= P.universe.volume24hMinUsd
 //   3. at least P.universe.historyBars contiguous 4h bars
 // Survivors are ranked by 24h quote volume and capped at `maxAssets`.
@@ -69,8 +69,12 @@ export function selectUniverse(candidates: UniverseCandidate[], opts: SelectOpts
 export function eligibleSymbol(s: { symbol: string; status: string; quoteAsset: string; isSpotTradingAllowed?: boolean }): boolean {
   if (s.quoteAsset !== 'USDT' || s.status !== 'TRADING' || s.isSpotTradingAllowed === false) return false
   const base = s.symbol.slice(0, -4)
-  // stablecoins / fiat pegs, leveraged tokens, wrapped & pegged assets
-  if (/^(USDC|FDUSD|TUSD|BUSD|DAI|USDP|USDD|EUR|GBP|AEUR|BIDR|IDRT|TRY|RUB|UAH|BRL|ARS|JPY|ZAR|PLN|RON|MXN|CZK|NGN|XUSD|USD1|PYUSD|RLUSD|BFUSD|USDE|SUSDE|USDS|LUSD|GUSD|FRAX|CRVUSD|USDF|USDG|AUSD|EURC|EURI|EURS)$/.test(base)) return false
+  // Stablecoins / fiat pegs. Their tiny ATR makes a 0.02% move look like a
+  // multi-ATR breakout, so they must never reach the Donchian scan.
+  // `U`, `RWUSD` and `KGST` are newer listings that bypassed the old list.
+  if (/^(USDC|FDUSD|TUSD|BUSD|DAI|USDP|USDD|EUR|GBP|AEUR|BIDR|IDRT|TRY|RUB|UAH|BRL|ARS|JPY|ZAR|PLN|RON|MXN|CZK|NGN|XUSD|USD1|PYUSD|RLUSD|BFUSD|USDE|SUSDE|USDS|LUSD|GUSD|FRAX|CRVUSD|USDF|USDG|AUSD|EURC|EURI|EURS|RWUSD|KGST|U)$/.test(base)) return false
+  // Gold-backed tokens track a single commodity, not a crypto market.
+  if (/^(XAUT|PAXG|KAU)$/.test(base)) return false
   if (/(UP|DOWN|BULL|BEAR|3L|3S|5L|5S)$/.test(base)) return false
   if (/^(WBTC|WBETH|WBNB|WETH|WMATIC|WAVAX|WSOL|WFTM|WONE|WCELO|WROSE|WZEC|WXRP)$/.test(base)) return false
   return true

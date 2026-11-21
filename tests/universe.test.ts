@@ -24,6 +24,27 @@ test('eligibility: USDT spot pairs only, no stablecoins / leveraged / wrapped as
   expect(eligibleSymbol(row('WBTCUSDT'))).toBe(false)
 })
 
+test('eligibility: newer stablecoins and gold-backed tokens are excluded', () => {
+  const row = (symbol: string) => ({ symbol, status: 'TRADING', quoteAsset: 'USDT', isSpotTradingAllowed: true })
+  // These passed the old list and were selected by the 2026-11-21 scan.
+  expect(eligibleSymbol(row('UUSDT'))).toBe(false)
+  expect(eligibleSymbol(row('RWUSDUSDT'))).toBe(false)
+  expect(eligibleSymbol(row('KGSTUSDT'))).toBe(false)
+  expect(eligibleSymbol(row('XAUTUSDT'))).toBe(false)
+  expect(eligibleSymbol(row('PAXGUSDT'))).toBe(false)
+})
+
+test('eligibility: crypto bases ending in B and tokenized stocks stay eligible', () => {
+  const row = (symbol: string) => ({ symbol, status: 'TRADING', quoteAsset: 'USDT', isSpotTradingAllowed: true })
+  for (const s of ['BNBUSDT', 'ARBUSDT', 'SHIBUSDT', 'TRBUSDT', 'CKBUSDT', 'DGBUSDT', 'BBUSDT']) {
+    expect(eligibleSymbol(row(s))).toBe(true)
+  }
+  // Tokenized stocks are intentionally kept in the universe.
+  for (const s of ['NVDABUSDT', 'SOXLBUSDT', 'MSTRBUSDT', 'MUBUSDT']) {
+    expect(eligibleSymbol(row(s))).toBe(true)
+  }
+})
+
 test('history: 450 bars and no gap in the window', () => {
   expect(historyCheck(candles(449)).historyOk).toBe(false)
   expect(historyCheck(candles(450)).historyOk).toBe(true)
