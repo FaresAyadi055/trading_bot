@@ -8,12 +8,13 @@ import { config } from './config'
  * HTTP hardening for the dashboard / API.
  *
  * The access token is a long-lived shared secret, so it gets three layers of protection:
- *  1. TLS enforcement: plaintext API calls are refused (except loopback), so the token is never
- *     accepted from an unencrypted connection. Behind Cloudflare Tunnel the edge terminates TLS
- *     and `TRUST_PROXY=1` makes the forwarded scheme trustworthy.
+ *  1. TLS enforcement: plaintext API calls are refused from public addresses (loopback and
+ *     private LAN addresses are exempt, so http://raspberrypi.local:3000 works at home), so the
+ *     token is never accepted from an unencrypted public connection. Behind Cloudflare Tunnel the
+ *     edge terminates TLS and `TRUST_PROXY=1` makes the forwarded scheme trustworthy.
  *  2. HttpOnly session cookies: the dashboard exchanges the token once for a signed, HttpOnly,
- *     Secure, SameSite=Strict cookie. JavaScript (and therefore XSS) can never read it back, and
- *     the token is not kept in localStorage.
+ *     Secure (when TLS is in use), SameSite=Strict cookie. JavaScript (and therefore XSS) can
+ *     never read it back, and the token is not kept in localStorage.
  *  3. Rate limiting: per-IP failed-auth budget with a temporary block, plus a per-IP request
  *     budget for the whole API surface.
  */
@@ -95,9 +96,39 @@ export const apiRateLimit: MiddlewareHandler = async (c, next) => {
 
 // ---- transport / proxy helpers -------------------------------------------------------------
 
-/** Best-effort client IP. Forwarded headers are only honoured when TRUST_PROXY=1. */
+const loopbackIp = (ip: string) =>
+  ip === '::1' || ip === '::ffff:127.0.0.1' || ip.startsWith('127.')
+
+/** Private / link-local address: a home or office LAN. */
+const privateIp = (ip: string): boolean => {
+  const v4 = ip.startsWith('::ffff:') ? ip.slice(7) : ip
+  if (v4.startsWith('127.') || v4.startsWith('10.') || v4.startsWith('192.168.') || v4.startsWith('169.254.')) return true
+  const m = /^172\.(\d{1,2})\./.exec(v4)
+  if (m) { const n = Number(m[1]); if (n >= 16 && n <= 31) return true }
+  const v6 = ip.toLowerCase()
+  return v6 === '::1' || v6.startsWith('fc') || v6.startsWith('fd') || v6.startsWith('fe80:')
+}
+
+/** Peer address, or null for in-process requests (tests) where Bun cannot report it. */
+const remoteAddress = (c: Context): string | null => {
+  try { return getConnInfo(c).remote.address ?? null } catch { return null }
+}
+
+/**
+ * Forwarded headers are only trustworthy when they come from the local tunnel/proxy. With
+ * HOST=0.0.0.0 a LAN client could otherwise forge CF-Connecting-IP / X-Forwarded-Proto.
+ * In-process requests (tests) have no peer address, so they keep the old behaviour.
+ */
+const trustedForwarded = (c: Context): boolean => {
+  if (!config.trustProxy) return false
+  const remote = remoteAddress(c)
+  return remote === null || loopbackIp(remote)
+}
+
+/** Best-effort client IP. Forwarded headers are only honoured from the local proxy. */
 export function clientIp(c: Context): string {
-  if (config.trustProxy) {
+  const remote = remoteAddress(c)
+  if (trustedForwarded(c)) {
     const cf = c.req.header('cf-connecting-ip')
     if (cf) return cf.split(',')[0].trim()
     const xff = c.req.header('x-forwarded-for')
@@ -105,20 +136,13 @@ export function clientIp(c: Context): string {
     const real = c.req.header('x-real-ip')
     if (real) return real.trim()
   }
-  try {
-    return getConnInfo(c).remote.address ?? 'unknown'
-  } catch {
-    return 'unknown'
-  }
+  return remote ?? 'unknown'
 }
-
-const loopbackIp = (ip: string) =>
-  ip === '::1' || ip === '::ffff:127.0.0.1' || ip.startsWith('127.')
 
 /** True when the request reached the app over TLS (directly or through a trusted proxy). */
 export function isSecureRequest(c: Context): boolean {
   if (new URL(c.req.url).protocol === 'https:') return true
-  if (!config.trustProxy) return false
+  if (!trustedForwarded(c)) return false
   const proto = (c.req.header('x-forwarded-proto') ?? '').split(',')[0].trim().toLowerCase()
   if (proto === 'https') return true
   const visitor = c.req.header('cf-visitor')
@@ -130,22 +154,27 @@ export function isSecureRequest(c: Context): boolean {
   return false
 }
 
-/** Loopback requests are exempt from HTTPS enforcement (local development). */
-export function isLoopbackRequest(c: Context): boolean {
-  const ip = clientIp(c)
-  if (ip !== 'unknown') return loopbackIp(ip)
+/**
+ * Local access: loopback or a private LAN address. Plain HTTP is accepted here (the token never
+ * leaves the home network); requests from public addresses still get HTTPS enforcement.
+ */
+export function isLocalRequest(c: Context): boolean {
+  const remote = remoteAddress(c)
+  if (remote) return privateIp(remote)
+  // No peer address (in-process tests): fall back to the request host.
   const host = new URL(c.req.url).hostname.toLowerCase()
-  return host === 'localhost' || host === '127.0.0.1' || host === '[::1]' || host === '::1'
+  return host === 'localhost' || host.endsWith('.local') || host === '127.0.0.1' || host === '[::1]' || host === '::1'
 }
 
 /**
- * Refuse plaintext API traffic and redirect page requests to HTTPS. A redirect is deliberately
- * not used for `/api/*`: a 307/308 would replay the Authorization header over the wire.
+ * Refuse plaintext API traffic from public addresses and redirect page requests to HTTPS. A
+ * redirect is deliberately not used for `/api/*`: a 307/308 would replay the Authorization header
+ * over the wire.
  */
 export const httpsGuard: MiddlewareHandler = async (c, next) => {
-  if (!config.forceHttps || isSecureRequest(c) || isLoopbackRequest(c)) return next()
+  if (!config.forceHttps || isSecureRequest(c) || isLocalRequest(c)) return next()
   if (c.req.path.startsWith('/api/')) {
-    return c.json({ error: 'https_required', message: 'This API only accepts HTTPS. Set FORCE_HTTPS=0 only for a trusted LAN.' }, 403)
+    return c.json({ error: 'https_required', message: 'This API only accepts HTTPS from outside the local network.' }, 403)
   }
   const url = new URL(c.req.url)
   url.protocol = 'https:'
@@ -250,7 +279,7 @@ function sameOrigin(c: Context): boolean {
   if (!origin) return true
   const expected = new URL(c.req.url).origin
   if (origin === expected) return true
-  if (config.trustProxy) {
+  if (trustedForwarded(c)) {
     const host = c.req.header('x-forwarded-host')?.split(',')[0].trim()
     const proto = (c.req.header('x-forwarded-proto') ?? '').split(',')[0].trim() || 'https'
     if (host && origin === `${proto}://${host}`) return true

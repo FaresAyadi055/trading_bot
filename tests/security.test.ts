@@ -38,6 +38,24 @@ describe('transport', () => {
     expect(((await r.json()) as any).error).toBe('https_required')
   })
 
+  test('plaintext API is allowed from a local/LAN address (http://raspberrypi.local:3000)', async () => {
+    const r = await app.request('http://raspberrypi.local:3000/api/status', { headers: { ...bearer, ...ip(11) } })
+    expect(r.status).toBe(200)
+  })
+
+  test('local HTTP login issues a cookie that works without TLS', async () => {
+    const r = await app.request('http://raspberrypi.local:3000/api/session', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...ip(12) },
+      body: JSON.stringify({ token: 'test-token' }),
+    })
+    expect(r.status).toBe(200)
+    expect(((await r.json()) as any).secure).toBe(false)
+    const cookie = r.headers.get('set-cookie') ?? ''
+    expect(cookie).toContain('tb_session=')
+    expect(/;\s*secure\b/i.test(cookie)).toBe(false)
+  })
+
   test('plaintext page requests redirect to HTTPS', async () => {
     const r = await http('/bot', { headers: { ...ip(3), 'x-forwarded-proto': 'http' } })
     expect(r.status).toBe(308)

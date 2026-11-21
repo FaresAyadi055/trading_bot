@@ -259,7 +259,7 @@ if (!process.env.NO_WORKER) {
   void flushNotifications()
   setInterval(() => void monitorTick().then(() => flushNotifications()).catch((e) => console.error('[monitor]', e)), config.stopPollMs)
   void executeAll().catch((e) => console.error('[executeAll]', e))
-  console.log(`[boot] MODE=${config.mode} exchange=${getExchange().name} execution=${config.executionBase} data=${config.dataBase}`)
+  console.log(`[boot] MODE=${config.mode} exchange=${getExchange().name} execution=${config.executionBase} data=${config.dataBase} url=${config.baseUrl}`)
 }
 
 // TUNNEL=true: start the temporary Cloudflare tunnel with the app and announce its URL once connected.

@@ -97,8 +97,9 @@ also has **+ add test capital** to credit fake USDT. Per bot: equity / P/L, posi
 protections, analytics and the transaction log.
 
 ## Security
-- Plaintext API traffic is refused (`FORCE_HTTPS`, loopback exempt) and page requests redirect to HTTPS.
-  `TRUST_PROXY` defaults to on while `TUNNEL=true`, so the forwarded scheme/host and client IP are trusted.
+- Plaintext API traffic from public addresses is refused (`FORCE_HTTPS`) and page requests redirect to HTTPS.
+  Loopback and private LAN addresses (for example `http://raspberrypi.local:3000`) are exempt. Forwarded headers are
+  trusted only from the local tunnel/proxy, so a LAN client cannot spoof `CF-Connecting-IP`.
 - The access token is exchanged for a signed, HttpOnly, Secure, SameSite=Strict session cookie; scripts can keep using
   `Authorization: Bearer <token>`.
 - Per-IP failed-auth lockout and a per-IP API request budget. Security headers (CSP, HSTS, nosniff, frame deny) are set
@@ -107,7 +108,8 @@ protections, analytics and the transaction log.
 ### Cloudflare Tunnel
 1. In `.env`: `TUNNEL=true`. That is the only setting needed — on boot the app starts a temporary
    `https://<random>.trycloudflare.com` quick tunnel and sends the URL to Telegram (`TRUST_PROXY` defaults to 1
-   while the tunnel is on; `HOST` stays `127.0.0.1`).
+   while the tunnel is on). Add `HOST=0.0.0.0` to also serve the dashboard on the LAN, e.g.
+   `BASE_URL=http://raspberrypi.local:3000`.
 2. Start the app (`bun run start` or `bun run dev`); the tunnel starts with it. `TUNNEL=false` disables it.
 3. The tunnel forwards to `http://127.0.0.1:3000`. A quick tunnel's URL changes on every run and has no uptime
    guarantee. For a stable hostname: `cp deploy/cloudflared.yml.example deploy/cloudflared.yml`, fill in the tunnel
@@ -122,7 +124,8 @@ protections, analytics and the transaction log.
 | `MODE` | — | **required**: `live` (spot, real funds) or `test` (paper trading) |
 | `BINANCE_API_KEY`, `BINANCE_API_SECRET` | — | **required in live mode**; spot key, no withdrawals. Ignored in test mode |
 | `PORT` | 3000 | |
-| `HOST` | `127.0.0.1` | bind address; set `0.0.0.0` only for a trusted LAN / container |
+| `HOST` | `127.0.0.1` | bind address; `0.0.0.0` makes the dashboard reachable on the LAN |
+| `BASE_URL` | `http://<HOST>:<PORT>` | address shown in the boot log / tunnel message, e.g. `http://raspberrypi.local:3000` |
 | `DB_PATH` | `data/trading.sqlite` | live database; in test mode it is the copy source (the paper DB is always separate) |
 | `PAPER_START_USDT` | 10000 | fake USDT seeded into a new paper account (test mode) |
 | `TEST_DB_PATH` | `data-test/trading.sqlite` | paper database file (test mode) |

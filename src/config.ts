@@ -34,11 +34,19 @@ const memoryDb = process.env.DB_PATH === ':memory:'
 const liveDbPath = process.env.DB_PATH && process.env.DB_PATH !== ':memory:' ? process.env.DB_PATH : 'data/trading.sqlite'
 const dbPath = memoryDb ? ':memory:' : mode === 'test' ? (process.env.TEST_DB_PATH ?? 'data-test/trading.sqlite') : liveDbPath
 
+const port = Number(process.env.PORT ?? 3000)
+/** Bind address. Loopback by default; HOST=0.0.0.0 makes the dashboard reachable on the LAN. */
+const host = process.env.HOST?.trim() || '127.0.0.1'
+// HOST=0.0.0.0 is a bind address, not something a browser can open.
+const browseHost = host === '0.0.0.0' || host === '::' || host === '[::]' ? 'localhost' : host
+const baseUrl = (process.env.BASE_URL?.trim() || `http://${browseHost}:${port}`).replace(/\/$/, '')
+
 export const config = {
   mode,
-  port: Number(process.env.PORT ?? 3000),
-  /** Bind address. Loopback by default; set HOST=0.0.0.0 only for a trusted LAN / container. */
-  host: process.env.HOST?.trim() || '127.0.0.1',
+  port,
+  host,
+  /** Address to open in the browser (BASE_URL); defaults to http://<HOST>:<PORT>. */
+  baseUrl,
   /** Paper mode never touches the live books: it works on its own copy under `data-test/`. */
   dbPath,
   /** The live database path, even in test mode (where `dbPath` points at the copy). */

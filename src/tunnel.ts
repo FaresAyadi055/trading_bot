@@ -31,7 +31,7 @@ async function sendUrl(url: string) {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         chat_id: config.telegramChatId,
-        text: `🛰️ Tunnel active\n${url}\nlocal: http://${config.host}:${config.port}`,
+        text: `🛰️ Tunnel active\n${url}\nlocal: ${config.baseUrl}`,
         disable_web_page_preview: true,
       }),
       signal: AbortSignal.timeout(10_000),
@@ -52,7 +52,7 @@ export function startTunnel(opts: { echo?: boolean } = {}): Tunnel | null {
   if (!config.tunnel) return null
   if (globalThis.__tbTunnel) return globalThis.__tbTunnel // survives `bun --hot` reloads
 
-  const localUrl = `http://${config.host}:${config.port}`
+  const localUrl = `http://${config.host === '0.0.0.0' || config.host === '::' || config.host === '[::]' ? '127.0.0.1' : config.host}:${config.port}`
   let args: string[]
   let namedUrl: string | null = null
   if (config.tunnelQuick) {
