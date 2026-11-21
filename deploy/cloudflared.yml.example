@@ -1,0 +1,24 @@
+# Cloudflare Tunnel configuration for the trading bot dashboard.
+#
+#   cp deploy/cloudflared.yml.example deploy/cloudflared.yml
+#   # fill in the tunnel UUID and the public hostname, then:
+#   bun run tunnel
+#
+# The app itself should bind to loopback (`HOST=127.0.0.1`) and trust the proxy headers
+# (`TRUST_PROXY=1 FORCE_HTTPS=1`). Cloudflare terminates TLS at the edge and connects to
+# cloudflared over an outbound TLS connection, so the access token never crosses the network
+# in plaintext.
+#
+# `deploy/cloudflared.yml` is gitignored because it references the tunnel credentials.
+
+tunnel: <TUNNEL_UUID>
+credentials-file: /home/<user>/.cloudflared/<TUNNEL_UUID>.json
+
+ingress:
+  - hostname: bot.example.com
+    service: http://127.0.0.1:3000
+    originRequest:
+      connectTimeout: 30s
+      noTLSVerify: false
+  # Everything else is rejected.
+  - service: http_status:404

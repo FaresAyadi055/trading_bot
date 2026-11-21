@@ -1,5 +1,5 @@
 // Pure strategy logic: score, per-symbol pick, cross-section and the regime engine (BOT_SPEC §7, §8).
-import { BEAR, BULL, NEUTRAL, P, STATE_NAME, type Strat } from './params'
+import { BEAR, BULL, NEUTRAL, P, STATE_NAME, slipFor, type Strat } from './params'
 import type { Row } from './features'
 import type { RegimeRec } from './types'
 
@@ -14,15 +14,15 @@ export function crossSection(rel: Map<string, number>): Map<string, number> {
   return out
 }
 
+/** Donchian score. The breakout term peaks at ~1 ATR and then declines (cap + the 2 ATR gate). */
 export function scoreStrategy(strategy: Strat, row: Row, rsPct: number): number {
-  const channel = strategy === 'A' ? row.donchian40 : row.donchian10
   const s = P.score
+  const over = ((row.close - row.donchian40) / row.atr14) / s.breakoutCapAtr
   const comp: Record<string, number> = {
-    breakout: clip01(((row.close - channel) / row.atr14) / s.breakoutCapAtr),
+    breakout: clip01(over) * (over > 1 ? Math.max(0, 1 - (over - 1) * 0.35) : 1),
     volume: clip01((row.volRatio - 1) / (s.volumeCapRatio - 1)),
     efficiency: clip01(row.persistenceEr),
     relStrength: clip01(rsPct),
-    compression: clip01(1 - row.cBbWidth / row.cWidthThreshold),
   }
   const w = s.weights[strategy]
   let num = 0, den = 0
@@ -38,53 +38,44 @@ export function effectiveMinScore(state: number, universeSize: number): number {
 }
 
 export type BlockReason =
-  | 'c_quality_gate' | 'score_below_min' | 'strategy_degraded' | 'stop_band' | 'cost_gate' | 'edge_gate'
-  | 'slot_taken' | 'min_notional' | 'drawdown_pause' | 'cooldown' | 'rolling_loss_cap' | 'all_strategies_degraded'
+  | 'score_below_min' | 'strategy_degraded' | 'cost_gate' | 'edge_gate'
+  | 'slot_taken' | 'min_notional' | 'drawdown_pause' | 'cooldown' | 'rolling_loss_cap'
   | 'entry_expired' | 'capital_guard' | 'exec_failed'
 export interface Blocked { symbol: string; strategy: Strat; reason: BlockReason; detail: string }
 export interface Pick {
   symbol: string; strategy: Strat; score: number; stopAtr: number; costInR: number; targetCostMultiple: number
-  atr: number; volumeUsdMedian: number
+  atr: number; volumeUsdMedian: number; slip: number
 }
 
-const ROUND_TRIP = 2 * P.fee + P.slip * (1 + P.stopSlipMult)
 const f2 = (x: number) => (Number.isFinite(x) ? x.toFixed(2) : 'n/a')
 
-/** Which of the locked C gates failed on a row whose raw (stock) C setup was present. */
-export function failedCGates(r: Row): string[] {
-  const out: string[] = []
-  if (!(r.cBbWidth <= P.C.gateCompressionRatio * r.cWidthThreshold)) out.push(`compression ${f2(r.cBbWidth / r.cWidthThreshold)}x > ${P.C.gateCompressionRatio}x`)
-  if (!(r.close - r.donchian10 >= P.C.gateBreakoutMarginAtr * r.atr14)) out.push(`breakout margin ${f2((r.close - r.donchian10) / r.atr14)} ATR < ${P.C.gateBreakoutMarginAtr}`)
-  if (!(r.donchian40 - r.close >= P.C.gateAvoidAAtr * r.atr14)) out.push(`too close to Donchian-40 (${f2((r.donchian40 - r.close) / r.atr14)} ATR < ${P.C.gateAvoidAAtr})`)
-  if (!(r.volRatio > P.C.volumeMult)) out.push(`volume ${f2(r.volRatio)}x < ${P.C.volumeMult}x`)
-  return out
-}
-
-/** Best eligible strategy for one symbol (or none) plus every signal that a filter rejected (spec §7.2). */
+/** Best eligible strategy for one symbol (or none) plus every signal that a filter rejected. */
 export function evaluateSymbol(row: Row, rsPct: number, minScore: number, degraded: Record<Strat, boolean>): { pick: Pick | null; blocked: Blocked[] } {
   const blocked: Blocked[] = []
-  const cand: Record<Strat, { signal: boolean; score: number; eligible: boolean }> = {
-    A: { signal: row.signalA, score: 0, eligible: false }, C: { signal: row.signalC, score: 0, eligible: false },
+  if (!row.signalA) return { pick: null, blocked }
+  const score = scoreStrategy('A', row, rsPct)
+  if (degraded.A) {
+    blocked.push({ symbol: row.symbol, strategy: 'A', reason: 'strategy_degraded', detail: 'Donchian is frozen after a losing streak' })
+    return { pick: null, blocked }
   }
-  for (const s of ['A', 'C'] as const) {
-    const c = cand[s]
-    if (!c.signal) continue
-    c.score = scoreStrategy(s, row, rsPct)
-    c.eligible = !degraded[s] && c.score >= minScore
-    if (degraded[s]) blocked.push({ symbol: row.symbol, strategy: s, reason: 'strategy_degraded', detail: `${s} is frozen after a losing streak` })
-    else if (!(c.score >= minScore)) blocked.push({ symbol: row.symbol, strategy: s, reason: 'score_below_min', detail: `score ${f2(c.score)} < min ${f2(minScore)}` })
+  if (!(score >= minScore)) {
+    blocked.push({ symbol: row.symbol, strategy: 'A', reason: 'score_below_min', detail: `score ${f2(score)} < min ${f2(minScore)}` })
+    return { pick: null, blocked }
   }
-  if (!row.signalC && row.rawC) blocked.push({ symbol: row.symbol, strategy: 'C', reason: 'c_quality_gate', detail: failedCGates(row).join('; ') || 'quality gate' })
-  if (!cand.A.eligible && !cand.C.eligible) return { pick: null, blocked }
-  const s: Strat = cand.A.eligible && (!cand.C.eligible || cand.A.score >= cand.C.score) ? 'A' : 'C'
-  const stopAtr = P[s].stopAtr
-  const costInR = ROUND_TRIP / stopAtr
+  const stopAtr = P.A.stopAtr
+  const slip = slipFor(row.symbol, Number.isFinite(row.volumeUsdMedian) ? row.volumeUsdMedian : 0)
+  const roundTrip = 2 * P.fee + slip * (1 + P.stopSlipMult)
+  const costInR = roundTrip / stopAtr
   const targetCostMultiple = 1 / costInR
-  const fail = (reason: BlockReason, detail: string) => { blocked.push({ symbol: row.symbol, strategy: s, reason, detail }); return { pick: null, blocked } }
-  if (!(P.gates.stopMinAtr <= stopAtr && stopAtr <= P.gates.stopMaxAtr)) return fail('stop_band', `stop ${stopAtr} ATR outside ${P.gates.stopMinAtr}-${P.gates.stopMaxAtr}`)
-  if (!(costInR <= P.maxCostInR)) return fail('cost_gate', `cost ${costInR.toFixed(4)}R > ${P.maxCostInR}R`)
-  if (!(targetCostMultiple >= P.minTargetCostMultiple)) return fail('edge_gate', `target/cost ${f2(targetCostMultiple)} < ${P.minTargetCostMultiple}`)
-  return { pick: { symbol: row.symbol, strategy: s, score: cand[s].score, stopAtr, costInR, targetCostMultiple, atr: row.atr14, volumeUsdMedian: Number.isFinite(row.volumeUsdMedian) ? row.volumeUsdMedian : 0 }, blocked }
+  if (!(costInR <= P.maxCostInR)) {
+    blocked.push({ symbol: row.symbol, strategy: 'A', reason: 'cost_gate', detail: `cost ${costInR.toFixed(4)}R > ${P.maxCostInR}R` })
+    return { pick: null, blocked }
+  }
+  if (!(targetCostMultiple >= P.minTargetCostMultiple)) {
+    blocked.push({ symbol: row.symbol, strategy: 'A', reason: 'edge_gate', detail: `target/cost ${f2(targetCostMultiple)} < ${P.minTargetCostMultiple}` })
+    return { pick: null, blocked }
+  }
+  return { pick: { symbol: row.symbol, strategy: 'A', score, stopAtr, costInR, targetCostMultiple, atr: row.atr14, volumeUsdMedian: Number.isFinite(row.volumeUsdMedian) ? row.volumeUsdMedian : 0, slip }, blocked }
 }
 
 /** Slot ranking: sort by (-score, -volumeUsdMedian, symbol). */

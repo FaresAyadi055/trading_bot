@@ -7,6 +7,7 @@ import { P, STATE_NAME } from './params'
 import { newDay } from './engine'
 import { barIndex } from './time'
 import { effectiveMinScore } from './strategy'
+import { universeFunnel, universeRows } from './universe_store'
 import type { BotRow, BotState } from './types'
 
 interface Stat { symbol: string; chg: number; range: number; quoteVol: number; above: boolean | null }
@@ -22,6 +23,25 @@ function dayStat(symbol: string, S: Series, t: number): Stat | null {
 }
 
 const compactUsd = (n: number) => (n >= 1e9 ? `${(n / 1e9).toFixed(2)}B` : n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(0)}K` : n.toFixed(0))
+const count = (n: number) => n.toLocaleString('en-US')
+
+/** Global universe filter funnel; the full asset list lives on the dashboard. */
+function universeSummary(): string {
+  const uf = universeFunnel()
+  if (!uf.updatedAt || !uf.selected) return '• no completed universe scan yet'
+  const rows = universeRows(true)
+  const vol = rows.reduce((a, r) => a + (r.quoteVolume24h || 0), 0)
+  const top = rows.slice(0, 3).map((r) => r.symbol.replace(/USDT$/, '')).join(', ')
+  const funnel = uf.total > 0
+    ? `${count(uf.total)} symbols → ${count(uf.eligible)} eligible → ${count(uf.volumeOk)} ≥ $${compactUsd(P.universe.volume24hMinUsd)}/24h → ${count(uf.historyOk)} ≥ ${P.universe.historyBars} bars`
+    : `${count(uf.volumeOk)} volume candidates → ${count(uf.historyOk)} ≥ ${P.universe.historyBars} bars`
+  const at = new Date(uf.updatedAt).toISOString().slice(0, 16).replace('T', ' ')
+  return [
+    `• funnel: ${funnel}`,
+    `• selected ${uf.selected}/${uf.maxAssets} · 24h volume ${compactUsd(vol)} USDT${top ? ` · top ${top}` : ''}`,
+    `• last scan ${at} UTC · full asset list on the dashboard`,
+  ].join('\n')
+}
 
 export function buildDailySummary(bot: BotRow, st: BotState, rows: Map<string, Row>, getSeries: (s: string) => Series | null, t: number, lastPx: (s: string) => number | null): string {
   const day = new Date(t).toISOString().slice(0, 10)
@@ -34,7 +54,6 @@ export function buildDailySummary(bot: BotRow, st: BotState, rows: Map<string, R
   if (st.pauseUntil != null) flags.push(`drawdown pause (${Math.max(0, st.pauseUntil - bar)} bars left)`)
   if (st.cooldown > 0) flags.push(`cooldown ${st.cooldown} bars`)
   if (st.frozenUntil.A > bar) flags.push('Donchian frozen')
-  if (st.frozenUntil.C > bar) flags.push('VCEB frozen')
   const weekR = st.closedR.filter((x) => x.bar > bar - P.lossWindowBars).reduce((a, x) => a + x.r, 0)
   const position = pos
     ? `holding ${pos.symbol} · ${M.strat(pos.strategy)} · ${M.fmt(pos.qty, 6)} @ ${M.px(pos.entryFill)} · ${M.sgn(((holdPx! - pos.entryFill) / pos.entryFill) * 100)}% · stop ${M.px(pos.stop)}`
@@ -77,7 +96,10 @@ export function buildDailySummary(bot: BotRow, st: BotState, rows: Map<string, R
     '',
     `Today: ${d.trades} closed trade(s), ${M.sgn(d.pnl)} USDT`,
     actions,
-    `Signals A/C: ${d.signals.A}/${d.signals.C} · blocked: ${blocked}`,
+    `Signals A: ${d.signals.A} · blocked: ${blocked}`,
+    '',
+    'Universe filter',
+    universeSummary(),
     '',
     'Market (24h)',
     market,

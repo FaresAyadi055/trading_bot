@@ -1,20 +1,23 @@
 // Live execution. The engine (src/engine.ts, `live` mode) only DECIDES: it queues a pending entry/exit or sets `exitNow`.
-// This module turns those decisions into real orders (Binance Convert in MODE=live, spot testnet in MODE=test) right at
-// the bar open and books the ACTUAL fill (price, quantity, order reference) into the bot's cash / position.
+// This module turns those decisions into real spot orders right at the bar open and books the ACTUAL fill
+// (price, quantity, order reference) into the bot's cash / position.
 //
 // Safety rules
 //  * BUYs are never retried: a failed or ambiguous buy drops the entry (a missed trade is cheap, a double buy is not).
 //  * SELLs are retried with back-off until they succeed (a position must never stay open by accident).
+//  * Every open position has a RESTING stop-loss order on Binance (STOP_LOSS, or STOP_LOSS_LIMIT when the symbol
+//    rejects it), refreshed whenever the trail ratchets. monitorTick() reconciles the order and keeps a market-sell
+//    backstop in case the exchange stop could not be placed or did not fill.
 //  * Before every buy the real balances are fetched and compared with the bots' claims (capital guard).
-//  * Convert has no resting stop orders, so monitorTick() polls prices and sells at market when a stop level is crossed.
 import { barIndex, barOpen, BAR_MS, LIVE_BAR_MAX_AGE_MS } from './time'
 import { tx } from './db'
 import { config } from './config'
 import { applyLiveEntry, closePosition, rejectEntry, sizeEntry } from './engine'
 import { applyPending, getBot, listBots, loadState, need, saveBot, saveState, writeFx } from './bots'
 import { fetchBalances, ledger } from './capital'
-import { getExchange } from './exchange'
+import { getExchange, type Fill, type OrderState } from './exchange'
 import * as M from './messages'
+import { notifyApiFailure } from './notify'
 import { P } from './params'
 import { killCheck } from './runner'
 import { newFx } from './types'
@@ -27,7 +30,7 @@ const ALERT_EVERY_MS = 30 * 60_000
 const errText = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
 /** Record a failed order: event + (rate-limited) Telegram alert with the Binance error reason. Back-off applies to sells only. */
-function failure(botId: string, what: 'BUY' | 'SELL', symbol: string, e: unknown, now: number, backoffMs = 0) {
+function failure(botId: string, what: 'BUY' | 'SELL' | 'STOP', symbol: string, e: unknown, now: number, backoffMs = 0) {
   const bot = getBot(botId)
   if (!bot) return
   if (backoffMs) retryAt.set(botId, now + backoffMs)
@@ -36,7 +39,7 @@ function failure(botId: string, what: 'BUY' | 'SELL', symbol: string, e: unknown
   fx.events.push({ ts: now, kind: 'exec_failed', symbol, detail: `${what} ${symbol}: ${errText(e)}`.slice(0, 500) })
   if (now - (alertedAt.get(key) ?? 0) > ALERT_EVERY_MS) {
     alertedAt.set(key, now)
-    fx.notes.push({ kind: 'lifecycle', text: M.msgOrderFailed(bot, what, symbol, errText(e), backoffMs > 0) })
+    fx.notes.push({ kind: 'lifecycle', text: M.msgOrderFailed(bot, what === 'STOP' ? 'SELL' : what, symbol, errText(e), backoffMs > 0) })
   }
   tx(() => writeFx(botId, fx))
   console.error(`[live] bot ${botId} ${what} ${symbol} failed:`, errText(e))
@@ -51,7 +54,50 @@ export async function executeBot(botId: string, now = Date.now()): Promise<void>
     if (st.position && (st.exitNow || st.pending?.kind === 'exit')) await sellOut(botId, now)
     else if (!st.position && st.pending?.kind === 'entry') await buyIn(botId, now)
     else if (!st.position && st.pending?.kind === 'exit') { st.pending = null; const { last } = loadState(botId); saveState(botId, st, last) } // nothing to sell
+    else if (st.position) await ensureStop(botId, st, now) // reconcile the resting stop and apply the latest ratchet
   } finally { busy.delete(botId) }
+}
+
+/** Book a sell that the exchange's resting stop order executed. */
+async function bookStopFill(botId: string, now: number, fill: Fill): Promise<boolean> {
+  const bot = getBot(botId)
+  if (!bot) return false
+  const { st, last } = loadState(botId)
+  const pos = st.position
+  if (!pos) return false
+  pos.stopOrderId = null
+  const fx = newFx()
+  const t = barOpen(now)
+  closePosition(bot, st, fx, { now, fresh: true, live: true }, barIndex(t), t, fill.price, pos.ratcheted ? 'STOP' : 'HARD_STOP',
+    { qty: fill.qty, usdt: fill.usdt, feeUsdt: fill.feeUsdt, orderRef: fill.orderRef })
+  st.pending = null
+  tx(() => { saveBot(bot); saveState(botId, st, last); writeFx(botId, fx) })
+  retryAt.delete(botId)
+  killCheck(botId)
+  await fetchBalances().catch(() => {}) // fresh balance for a capital increase that was queued behind this trade
+  applyPending(botId, now)
+  return true
+}
+
+/**
+ * Cancel the resting stop before a market sell. Returns true when the stop had ALREADY filled (and was booked),
+ * in which case the caller must not sell again. Throws when the order state cannot be resolved, so the sell is
+ * retried later instead of risking a double sell.
+ */
+async function releaseStop(botId: string, st: NonNullable<ReturnType<typeof loadState>['st']>, now: number): Promise<boolean> {
+  const pos = st.position
+  if (!pos?.stopOrderId) return false
+  const ex = getExchange()
+  try { await ex.cancelOrder(pos.symbol, pos.stopOrderId) }
+  catch (e) {
+    let s: OrderState | null = null
+    try { s = await ex.orderStatus(pos.symbol, pos.stopOrderId) } catch { /* unresolved: retry later */ }
+    if (s?.status === 'FILLED' && s.fill) { await bookStopFill(botId, now, s.fill); return true }
+    throw e
+  }
+  pos.stopOrderId = null
+  pos.stopOrderPlaced = undefined
+  return false
 }
 
 async function sellOut(botId: string, now: number) {
@@ -59,7 +105,9 @@ async function sellOut(botId: string, now: number) {
   const { st } = loadState(botId)
   const pos = st.position!
   const reason = st.exitNow?.reason ?? 'TRAIL'
-  let fill
+  try { if (await releaseStop(botId, st, now)) return } // the resting stop filled first
+  catch (e) { return failure(botId, 'SELL', pos.symbol, e, now, 60_000) }
+  let fill: Fill
   try { fill = await getExchange().sell(pos.symbol, pos.qty, { clientId: `tb${botId}x${now.toString(36)}` }) }
   catch (e) { return failure(botId, 'SELL', pos.symbol, e, now, /reconcile manually/i.test(errText(e)) ? 10 * 60_000 : 60_000) }
   // state may have moved while we awaited: re-read before booking
@@ -74,7 +122,59 @@ async function sellOut(botId: string, now: number) {
   tx(() => { saveBot(bot); saveState(botId, s2, last); writeFx(botId, fx) })
   retryAt.delete(botId)
   killCheck(botId)
+  await fetchBalances().catch(() => {}) // fresh balance for a capital increase that was queued behind this trade
   applyPending(botId, now)
+}
+
+/**
+ * Make the exchange-side stop match the position: reconcile a fill/cancel, then place the resting stop at
+ * `pos.restingStop` (initial hard stop, then the ratcheted level). Small improvements are ignored to avoid churn.
+ */
+async function ensureStop(botId: string, st: NonNullable<ReturnType<typeof loadState>['st']>, now: number) {
+  const pos = st.position
+  if (!pos) return
+  const ex = getExchange()
+
+  if (pos.stopOrderId) {
+    let s: OrderState | null = null
+    try { s = await ex.orderStatus(pos.symbol, pos.stopOrderId) }
+    catch { pos.stopOrderId = null; pos.stopOrderPlaced = undefined } // unknown / cancelled: recreate below
+    if (s) {
+      if (s.status === 'FILLED') { if (s.fill) await bookStopFill(botId, now, s.fill); return }
+      if (['CANCELED', 'EXPIRED', 'EXPIRED_IN_MATCH', 'REJECTED'].includes(s.status)) { pos.stopOrderId = null; pos.stopOrderPlaced = undefined }
+    }
+  }
+
+  const desired = pos.restingStop
+  if (!(desired > 0)) return
+  const placed = pos.stopOrderPlaced
+  if (pos.stopOrderId && placed != null && desired <= placed * 1.0005) return // already at (or above) the level
+  if (pos.stopOrderId) {
+    try { await ex.cancelOrder(pos.symbol, pos.stopOrderId) }
+    catch (e) {
+      const s = await ex.orderStatus(pos.symbol, pos.stopOrderId).catch(() => null)
+      if (s?.status === 'FILLED' && s.fill) { await bookStopFill(botId, now, s.fill); return }
+      throw e
+    }
+    pos.stopOrderId = null
+  }
+
+  try {
+    const o = await ex.placeStop(pos.symbol, pos.qty, desired, { clientId: `tb${botId}s${now.toString(36)}` })
+    pos.stopOrderId = o.orderRef
+    pos.stopOrderPlaced = o.stopPrice
+    const fx = newFx()
+    fx.events.push({ ts: now, kind: 'stop_placed', symbol: pos.symbol, detail: `${o.type} @ ${o.stopPrice} qty ${o.qty}` })
+    tx(() => writeFx(botId, fx))
+  } catch (e) {
+    // keep the position: the monitor sells at market if price reaches the stop
+    pos.stopOrderId = null
+    pos.stopOrderPlaced = undefined
+    failure(botId, 'STOP', pos.symbol, e, now)
+    return
+  }
+  const { last } = loadState(botId)
+  tx(() => saveState(botId, st, last))
 }
 
 async function buyIn(botId: string, now: number) {
@@ -104,12 +204,12 @@ async function buyIn(botId: string, now: number) {
   if (!bot) return
   const { st: s1 } = loadState(botId)
   if (!s1.pending || s1.position) return
-  const z = sizeEntry(bot, pend, ref * (1 + P.slip))
+  const z = sizeEntry(bot, pend, ref * (1 + (pend.slip ?? P.slip.mid)))
   if (!z.ok) return drop('min_notional', z.why)
   const L = ledger(free)
   if (L.shortfall > 0 || free + 1e-9 < z.notional) return drop('capital_guard', `account has ${free.toFixed(2)} USDT free, bots claim ${L.botCash.toFixed(2)}, order needs ${z.notional.toFixed(2)}`)
 
-  let fill
+  let fill: Fill
   try { fill = await ex.buy(pend.symbol, z.notional, { clientId: `tb${botId}b${now.toString(36)}`, refPrice: ref, maxSlipPct: config.maxEntrySlipPct }) }
   catch (e) { failure(botId, 'BUY', pend.symbol, e, now); return drop('exec_failed', errText(e).slice(0, 200)) }
 
@@ -120,21 +220,24 @@ async function buyIn(botId: string, now: number) {
   const fx = newFx()
   applyLiveEntry(b2, s2, fx, { now, fresh: true, live: true }, t, { qty: fill.qty, usdt: fill.usdt, feeUsdt: fill.feeUsdt, orderRef: fill.orderRef })
   tx(() => { saveBot(b2); saveState(botId, s2, last); writeFx(botId, fx) })
+  // protect the position immediately: the resting stop goes in right after the buy
+  const { st: s3 } = loadState(botId)
+  if (s3.position) await ensureStop(botId, s3, now).catch((e) => failure(botId, 'STOP', pend.symbol, e, now))
 }
 
 /** Execute the decisions of every bot (called right after a bar was processed, and on boot). */
 export async function executeAll(now = Date.now()) {
   for (const b of listBots()) {
     const { st } = loadState(b.id)
-    if (st.exitNow || st.pending) await executeBot(b.id, now).catch((e) => console.error('[live] execute', b.id, e))
+    if (st.exitNow || st.pending || st.position) await executeBot(b.id, now).catch((e) => console.error('[live] execute', b.id, e))
   }
 }
 
 let monitoring = false
 /**
- * Stop monitor: Convert cannot rest stop orders on the exchange, so every STOP_POLL_SECONDS the last price of each held
- * asset is compared with the position's stop levels (C: trail/stop, all: hard stop). A breach sells at market.
- * It also retries sells that failed earlier.
+ * Stop monitor. The resting order on Binance is the primary protection; this tick reconciles it (fill / cancel /
+ * placement failure) and keeps a market-sell backstop when price is already through the stop. It also retries
+ * sells that failed earlier.
  */
 export async function monitorTick(now = Date.now()) {
   if (monitoring) return
@@ -142,24 +245,29 @@ export async function monitorTick(now = Date.now()) {
   try {
     const held = listBots().map((b) => ({ b, st: loadState(b.id).st })).filter((x) => x.st.position)
     for (const x of held) if (x.st.exitNow || x.st.pending?.kind === 'exit') await executeBot(x.b.id, now).catch((e) => console.error('[live] retry', x.b.id, e))
-    const open = held.map((x) => ({ id: x.b.id, symbol: x.st.position!.symbol })).filter((x) => !busy.has(x.id))
+    const open = held.map((x) => x.b.id).filter((id) => !busy.has(id))
     if (!open.length) return
+
+    // reconcile + ratchet every resting stop first (this may book a fill)
+    for (const id of open) await executeBot(id, now).catch((e) => console.error('[live] stop', id, e))
+
+    const live = open.map((id) => ({ id, st: loadState(id).st })).filter((x) => x.st.position && !x.st.exitNow && !busy.has(x.id))
+    if (!live.length) return
     let prices: Record<string, number>
-    try { prices = await getExchange().prices([...new Set(open.map((x) => x.symbol))]) } catch { return }
-    for (const { id } of open) {
-      const { st, last } = loadState(id)
-      const pos = st.position
-      if (!pos || st.exitNow || busy.has(id)) continue
+    try { prices = await getExchange().prices([...new Set(live.map((x) => x.st.position!.symbol))]) } catch (e) {
+      notifyApiFailure('prices', M.msgApiFailed('Stop-monitor prices', errText(e)))
+      return
+    }
+    for (const { id, st } of live) {
+      const pos = st.position!
       const px = prices[pos.symbol]
       if (!(px > 0)) continue
-      let reason: string | null = null
-      if (pos.strategy === 'C' && px <= pos.stop) reason = pos.ratcheted ? 'TRAIL' : 'STOP'
-      else if (px <= pos.hardStop) reason = 'HARD_STOP'
-      if (!reason) continue
+      if (!(px <= pos.restingStop)) continue
+      const { last } = loadState(id)
       const t = barOpen(now)
-      st.exitNow = { reason, bar: barIndex(t), t }
+      st.exitNow = { reason: pos.ratcheted ? 'STOP' : 'HARD_STOP', bar: barIndex(t), t }
       const fx = newFx()
-      fx.events.push({ ts: now, kind: 'exit_triggered', symbol: pos.symbol, detail: `${reason}: price ${px} <= ${reason === 'HARD_STOP' ? pos.hardStop : pos.stop}` })
+      fx.events.push({ ts: now, kind: 'exit_triggered', symbol: pos.symbol, detail: `price ${px} <= resting stop ${pos.restingStop}` })
       tx(() => { saveState(id, st, last); writeFx(id, fx) }) // persist the intent BEFORE the order: a crash cannot lose it
       await executeBot(id, now).catch((e) => console.error('[live] stop sell', id, e))
     }

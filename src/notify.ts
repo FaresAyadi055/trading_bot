@@ -4,6 +4,20 @@ import { db } from './db'
 let flushing = false
 const MAX_AGE_MS = 24 * 3600_000
 
+const lastAlert = new Map<string, number>()
+/**
+ * Queue a Telegram alert for a FAILED Binance API request (candles, universe, balances, prices...).
+ * There is no periodic connectivity probe: this is only called from a real request that returned an error.
+ * Rate-limited per key so a prolonged outage cannot flood the chat.
+ */
+export function notifyApiFailure(key: string, text: string, everyMs = 30 * 60_000) {
+  if (!config.telegramToken || !config.telegramChatId) return
+  const now = Date.now()
+  if (now - (lastAlert.get(key) ?? 0) < everyMs) return
+  lastAlert.set(key, now)
+  db.query('INSERT INTO notifications(ts,bot_id,kind,strategy,text) VALUES(?,?,?,?,?)').run(now, null, 'api_error', null, text)
+}
+
 /**
  * Deliver the Telegram outbox. Messages were composed (and committed) when the event happened, so a crash or an
  * outage only delays them: failures stay queued and are retried on the next flush. Delivered rows are deleted.

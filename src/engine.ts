@@ -4,20 +4,18 @@
 import { barIndex } from './time'
 import type { Row } from './features'
 import * as M from './messages'
-import { BEAR, P, type Strat } from './params'
+import { BEAR, P, slipFor, type Strat } from './params'
 import { crossSection, effectiveMinScore, evaluateSymbol, rankCmp, regimeName, regimeUpdate, type Blocked, type BlockReason, type Pick } from './strategy'
 import type { BotRow, BotState, DayLog, Fx, Position } from './types'
 
-const SLIP = P.slip
-const STOP_SLIP = P.slip * P.stopSlipMult
 const DAY_LINES_MAX = 40
 const BLOCK_DEDUPE_BARS = 6 // the same (symbol, strategy, reason) alert is repeated at most once per 24h
 
-export const newDay = (startBar: number): DayLog => ({ startBar, lines: [], signals: { A: 0, C: 0 }, blocked: {}, trades: 0, pnl: 0 })
+export const newDay = (startBar: number): DayLog => ({ startBar, lines: [], signals: { A: 0 }, blocked: {}, trades: 0, pnl: 0 })
 export function newBotState(cash: number, startBar = 0): BotState {
   return {
     position: null, pending: null, peak: cash, pauseUntil: null, cooldown: 0, consecutiveLosses: 0,
-    frozenUntil: { A: 0, C: 0 }, rHistory: { A: [], C: [] }, closedR: [], regime: { state: 1, pending: null, count: 0 },
+    frozenUntil: { A: 0 }, rHistory: { A: [] }, closedR: [], regime: { state: 1, pending: null, count: 0 },
     counters: {}, day: newDay(startBar), blockNotified: {},
   }
 }
@@ -92,13 +90,18 @@ const rejectEntry = (bot: BotRow, st: BotState, fx: Fx, o: StepOpts, t: number, 
 }
 export { rejectEntry }
 
-/** Position size and stop levels for a pending entry at reference fill price `fill` (spec §9.2). */
+/**
+ * Position size and stop levels for a pending entry at reference fill price `fill` (spec §9.2).
+ * `stopDist` is the worst-case distance (hard stop + stop slippage), so the budgeted risk equals the loss
+ * the position can actually take.
+ */
 export function sizeEntry(bot: BotRow, pend: NonNullable<BotState['pending']>, fill: number):
   { ok: true; notional: number; stop: number; hard: number; stopDist: number } | { ok: false; why: string } {
   const atr = pend.atr!
-  const stop = fill - pend.stopAtr! * atr
-  const hard = fill - P.hardStopAtr * atr
-  const stopDist = fill - stop
+  const stop = fill - P.A.stopAtr * atr
+  const hard = fill - P.A.hardStopAtr * atr
+  const slip = pend.slip ?? P.slip.mid
+  const stopDist = (fill - hard) + fill * slip * P.stopSlipMult
   if (!(stopDist > 0) || !(bot.cash > 0)) return { ok: false, why: 'bad stop distance or no cash' }
   const notional = Math.min((bot.cash * P.riskPerTrade * pend.riskMult! * fill) / stopDist, bot.cash * P.maxPositionFraction, bot.cash)
   if (!(notional >= P.minNotional)) return { ok: false, why: `notional ${notional.toFixed(2)} USDT below the ${P.minNotional} USDT minimum` }
@@ -107,13 +110,15 @@ export function sizeEntry(bot: BotRow, pend: NonNullable<BotState['pending']>, f
 
 /** Book an opened position (shared by the simulated fill and the real exchange fill). */
 function openPosition(bot: BotRow, st: BotState, fx: Fx, o: StepOpts, t: number, pend: NonNullable<BotState['pending']>,
-  p: { fill: number; notional: number; qty: number; fee: number; stop: number; hard: number; stopDist: number; high: number; close: number; orderRef?: string }) {
+  p: { fill: number; notional: number; qty: number; fee: number; stop: number; hard: number; stopDist: number; high: number; close: number; slip: number; orderRef?: string }) {
   bot.cash -= p.notional
   st.position = {
-    symbol: pend.symbol, strategy: pend.strategy, entryTs: t, entryFill: p.fill, qty: p.qty, notional: p.notional, initialStop: p.stop, stop: p.stop, hardStop: p.hard,
+    symbol: pend.symbol, strategy: pend.strategy, entryTs: t, entryFill: p.fill, qty: p.qty, notional: p.notional,
+    initialStop: p.stop, stop: p.stop, hardStop: p.hard, restingStop: p.hard, stopOrderId: null,
     highestClose: p.close, highestHigh: p.high, ratcheted: false, barsHeld: 1, riskUsdt: p.qty * p.stopDist,
+    maxUnrealizedR: 0, slip: p.slip,
   }
-  inc(st.counters, pend.strategy === 'A' ? 'executedA' : 'executedC')
+  inc(st.counters, 'executedA')
   fx.tx.push({
     ts: o.now, bar_time: t, symbol: pend.symbol, action: 'BUY', strategy: pend.strategy, price: p.fill, qty: p.qty, notional: p.notional, fee: p.fee,
     pnl: null, pnl_pct: null, r_multiple: null, exit_reason: null, cash_after: bot.cash, order_ref: p.orderRef ?? null,
@@ -126,11 +131,12 @@ function fillEntry(bot: BotRow, st: BotState, fx: Fx, o: StepOpts, t: number, ro
   const pend = st.pending!
   st.pending = null
   if (!row || !Number.isFinite(row.open) || row.open <= 0) return rejectEntry(bot, st, fx, o, t, pend, 'no candle for the fill bar; entry dropped')
-  const fill = row.open * (1 + SLIP)
+  const slip = pend.slip ?? slipFor(pend.symbol, row.volumeUsdMedian)
+  const fill = row.open * (1 + slip)
   const z = sizeEntry(bot, pend, fill)
   if (!z.ok) return rejectEntry(bot, st, fx, o, t, pend, z.why)
   const qty = (z.notional - z.notional * P.fee) / fill
-  openPosition(bot, st, fx, o, t, pend, { fill, notional: z.notional, qty, fee: z.notional * P.fee, stop: z.stop, hard: z.hard, stopDist: z.stopDist, high: row.high, close: row.close })
+  openPosition(bot, st, fx, o, t, pend, { fill, notional: z.notional, qty, fee: z.notional * P.fee, stop: z.stop, hard: z.hard, stopDist: z.stopDist, high: row.high, close: row.close, slip })
 }
 
 /** Live: book a position from a REAL buy. Stops are derived from the effective fill price. `t` = open of the bar the order was filled in. */
@@ -138,49 +144,50 @@ export function applyLiveEntry(bot: BotRow, st: BotState, fx: Fx, o: StepOpts, t
   const pend = st.pending!
   st.pending = null
   const fill = real.usdt / real.qty
-  const stop = fill - pend.stopAtr! * pend.atr!
-  const hard = fill - P.hardStopAtr * pend.atr!
-  openPosition(bot, st, fx, o, t, pend, { fill, notional: real.usdt, qty: real.qty, fee: real.feeUsdt, stop, hard, stopDist: fill - stop, high: fill, close: fill, orderRef: real.orderRef })
+  const stop = fill - P.A.stopAtr * pend.atr!
+  const hard = fill - P.A.hardStopAtr * pend.atr!
+  const slip = pend.slip ?? P.slip.mid
+  const stopDist = (fill - hard) + fill * slip * P.stopSlipMult
+  openPosition(bot, st, fx, o, t, pend, { fill, notional: real.usdt, qty: real.qty, fee: real.feeUsdt, stop, hard, stopDist, high: fill, close: fill, slip, orderRef: real.orderRef })
 }
 
 function manage(bot: BotRow, st: BotState, fx: Fx, o: StepOpts, i: number, t: number, row: Row | undefined) {
   const pos = st.position!
   if (!row) { pos.barsHeld++; return } // no candle for the held symbol on this bar
   const { open: op, high: h, low: l, close: c } = row
-  // 1-2. resting intrabar orders, resolved before anything else (C trail/stop; both hard stops)
-  if (pos.strategy === 'C' && l <= pos.stop) {
-    closePosition(bot, st, fx, o, i, t, (op <= pos.stop ? op : pos.stop) * (1 - STOP_SLIP), pos.ratcheted ? 'TRAIL' : 'STOP')
+  const atr = row.atr14
+
+  // 1. resting stop (exchange-side in live, intrabar in the simulated path), resolved before anything else
+  if (Number.isFinite(pos.restingStop) && l <= pos.restingStop) {
+    const level = op <= pos.restingStop ? op : pos.restingStop
+    closePosition(bot, st, fx, o, i, t, level * (1 - pos.slip * P.stopSlipMult), pos.ratcheted ? 'STOP' : 'HARD_STOP')
     return
   }
-  if (l <= pos.hardStop) {
-    closePosition(bot, st, fx, o, i, t, (op <= pos.hardStop ? op : pos.hardStop) * (1 - STOP_SLIP), 'HARD_STOP')
-    return
-  }
-  // safety (deviation from the reference, which skips the bar): features unavailable -> keep the position
-  // protected by the resting stops above and the time cap, but do not ratchet.
+  // safety: features unavailable -> keep the position protected by the resting stop and the time cap, do not ratchet
   if (!row.dataOk) {
-    if (pos.barsHeld >= P.maxHoldBars) closePosition(bot, st, fx, o, i, t, c * (1 - SLIP), 'TIME')
+    if (pos.barsHeld >= P.maxHoldBars) closePosition(bot, st, fx, o, i, t, c * (1 - pos.slip), 'TIME')
     else pos.barsHeld++
     return
   }
-  const atr = row.atr14
-  // 3. ratchet (the stop set on this bar protects from the next bar on)
-  let trailSignal = false
-  if (pos.strategy === 'A') {
-    pos.highestClose = Math.max(pos.highestClose, c)
-    const cand = pos.highestClose - P.A.trailAtr * atr
-    if (Number.isFinite(cand)) pos.stop = Math.max(pos.stop, cand)
-    trailSignal = c < pos.stop
-  } else {
-    pos.highestHigh = Math.max(pos.highestHigh, h)
-    const cand = pos.highestHigh - P.C.trailAtr * atr
-    if (Number.isFinite(cand) && cand > pos.stop) { pos.stop = cand; pos.ratcheted = true }
-  }
-  // 4. kill switch, time cap, regime tightening
+
+  // 2. track the best price / best unrealized R, then ratchet the close-based trail and the resting stop
+  pos.highestClose = Math.max(pos.highestClose, c)
+  pos.highestHigh = Math.max(pos.highestHigh, h)
   const rNow = (c - pos.entryFill) / (pos.entryFill - pos.initialStop)
+  const rHigh = (pos.highestHigh - pos.entryFill) / (pos.entryFill - pos.initialStop)
+  if (Number.isFinite(rHigh)) pos.maxUnrealizedR = Math.max(pos.maxUnrealizedR, rHigh)
+  const trail = pos.highestClose - P.A.trailAtr * atr
+  if (Number.isFinite(trail)) pos.stop = Math.max(pos.stop, trail)
+  const resting = Math.max(pos.hardStop, pos.stop - P.A.restingTrailAtr * atr)
+  if (Number.isFinite(resting) && resting > pos.restingStop) {
+    pos.restingStop = resting
+    pos.ratcheted = pos.restingStop > pos.hardStop
+  }
+
+  // 3. kill switch, time cap, regime tightening
   const pctl = row.atrPctPctl
   if (Number.isFinite(pctl) && pctl > P.kill.pctlMin) {
-    if (rNow < P.kill.rNowMin) { closePosition(bot, st, fx, o, i, t, c * (1 - SLIP), 'KILL'); return }
+    if (rNow < P.kill.rNowMin) { closePosition(bot, st, fx, o, i, t, c * (1 - pos.slip), 'KILL'); return }
     const ks = c - P.kill.tightenAtr * atr
     if (Number.isFinite(ks) && ks > pos.stop) {
       pos.stop = ks
@@ -190,13 +197,18 @@ function manage(bot: BotRow, st: BotState, fx: Fx, o: StepOpts, i: number, t: nu
       dayLine(st, `${hhmm(t)} stop tightened ${pos.symbol} -> ${M.px(ks)} (volatility kill switch)`)
     }
   }
-  if (pos.barsHeld >= P.maxHoldBars) { closePosition(bot, st, fx, o, i, t, c * (1 - SLIP), 'TIME'); return }
+  if (pos.barsHeld >= P.maxHoldBars) { closePosition(bot, st, fx, o, i, t, c * (1 - pos.slip), 'TIME'); return }
   if (P.regime.tightenOnBear && st.regime.state === BEAR) {
     const rs = c - P.regime.tightenAtrMult * atr
     if (Number.isFinite(rs) && rs > pos.stop) pos.stop = rs
   }
-  // 5. A's close-based trail: exit queued for the next open
-  if (trailSignal) {
+  // 4. stagnation: free the slot if the trade never reached +1R by bar 36
+  if (pos.barsHeld >= P.A.stagnationBars && pos.maxUnrealizedR < P.A.stagnationMinR) {
+    closePosition(bot, st, fx, o, i, t, c * (1 - pos.slip), 'STAGNATION')
+    return
+  }
+  // 5. close-based trail exit: queued for the next open
+  if (c < pos.stop) {
     st.pending = { kind: 'exit', symbol: pos.symbol, strategy: pos.strategy, queuedBar: i }
     fx.events.push({ ts: o.now, kind: 'exit_queued', symbol: pos.symbol, detail: `${M.strat(pos.strategy)} close ${c} < stop ${pos.stop}` })
     note(fx, o, false, 'exit_queued', M.msgExitQueued(bot, pos.symbol, pos.strategy, `close ${M.px(c)} below trailing stop ${M.px(pos.stop)}`, t), pos.strategy)
@@ -242,7 +254,7 @@ export function stepBot(bot: BotRow, st: BotState, rows: Map<string, Row>, t: nu
       } else fillEntry(bot, st, fx, o, t, rows.get(pend.symbol))
     } else {
       const row = rows.get(pend.symbol)
-      if (st.position && (o.live || (row && Number.isFinite(row.open)))) closePosition(bot, st, fx, o, i, t, row ? row.open * (1 - SLIP) : NaN, 'TRAIL')
+      if (st.position && (o.live || (row && Number.isFinite(row.open)))) closePosition(bot, st, fx, o, i, t, row ? row.open * (1 - st.position.slip) : NaN, 'TRAIL')
       st.pending = null
     }
     if (o.live && st.exitNow) return
@@ -256,23 +268,20 @@ export function stepBot(bot: BotRow, st: BotState, rows: Map<string, Row>, t: nu
 }
 
 function scan(bot: BotRow, st: BotState, rows: Map<string, Row>, live: Row[], i: number, t: number, fx: Fx, o: StepOpts) {
-  for (const r of live) { if (r.signalA) st.day.signals.A++; if (r.signalC) st.day.signals.C++ }
+  for (const r of live) if (r.signalA) st.day.signals.A++
   const weekR = st.closedR.reduce((a, x) => a + x.r, 0)
-  const degraded = { A: st.frozenUntil.A > i, C: st.frozenUntil.C > i }
+  const degraded = { A: st.frozenUntil.A > i }
   const block: BlockReason | null =
     st.pauseUntil != null ? 'drawdown_pause'
       : st.cooldown > 0 ? 'cooldown'
         : weekR <= P.lossFloorR ? 'rolling_loss_cap'
-          : degraded.A && degraded.C ? 'all_strategies_degraded' : null
+          : degraded.A ? 'strategy_degraded' : null
   const reg = P.regime.table[st.regime.state]!
   const blocked: Blocked[] = []
 
   if (block || !reg.allowEntries) {
     const why = block ?? 'cooldown'
-    for (const r of live) {
-      if (r.signalA) blocked.push({ symbol: r.symbol, strategy: 'A', reason: why, detail: '' })
-      if (r.signalC) blocked.push({ symbol: r.symbol, strategy: 'C', reason: why, detail: '' })
-    }
+    for (const r of live) if (r.signalA) blocked.push({ symbol: r.symbol, strategy: 'A', reason: why, detail: '' })
     report(bot, st, blocked, i, t, fx, o)
     return
   }
@@ -290,8 +299,8 @@ function scan(bot: BotRow, st: BotState, rows: Map<string, Row>, live: Row[], i:
   for (const p of picks.slice(1)) blocked.push({ symbol: p.symbol, strategy: p.strategy, reason: 'slot_taken', detail: `${best!.symbol} ${M.strat(best!.strategy)} scored ${best!.score.toFixed(2)} vs ${p.score.toFixed(2)}` })
   if (best) {
     const riskMult = P.strategyMult[best.strategy] * reg.riskMult
-    st.pending = { kind: 'entry', symbol: best.symbol, strategy: best.strategy, queuedBar: i, score: best.score, atr: best.atr, stopAtr: best.stopAtr, riskMult }
-    inc(st.counters, `queued${best.strategy}`)
+    st.pending = { kind: 'entry', symbol: best.symbol, strategy: best.strategy, queuedBar: i, score: best.score, atr: best.atr, stopAtr: best.stopAtr, riskMult, slip: best.slip }
+    inc(st.counters, 'queuedA')
     fx.events.push({ ts: o.now, kind: 'entry_queued', symbol: best.symbol, detail: `${M.strat(best.strategy)} score ${best.score.toFixed(3)}` })
     const rank = picks.length > 1 ? `Best of ${picks.length} candidates` : 'Only candidate'
     note(fx, o, false, 'entry_queued', M.msgEntryQueued(bot, best.symbol, best.strategy, best.score, regimeName(st.regime.state), riskMult, rank, t), best.strategy)

@@ -5,11 +5,13 @@ import { newBotState, newDay } from './engine'
 import { barIndex } from './time'
 import type { BotState, Position } from './types'
 
-export const SCHEMA_VERSION = 3
+export const SCHEMA_VERSION = 5
 
 export function migrate(db: Database, from: number): void {
   if (from < 2) v1ToV2(db)
   if (from < 3) v2ToV3(db)
+  if (from < 4) v3ToV4(db)
+  if (from < 5) v4ToV5(db)
   db.query("INSERT INTO meta(key,value) VALUES('schema_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(String(SCHEMA_VERSION))
 }
 
@@ -28,25 +30,26 @@ function v1ToV2(db: Database) {
           if (r.last_processed_bar != null) last = Math.max(last ?? 0, r.last_processed_bar)
           st.cooldown = Math.max(st.cooldown, o.cooldownLeft ?? 0)
           st.consecutiveLosses = Math.max(st.consecutiveLosses, o.consecutiveLosses ?? 0)
-          for (const k of ['A', 'C'] as const) {
-            if (o.degradation?.[k] != null) st.frozenUntil[k] = Math.max(st.frozenUntil[k], o.degradation[k])
-            st.rHistory[k].push(...(o.recentTradeR?.[k] ?? []))
-            st.rHistory[k] = st.rHistory[k].slice(-12)
-          }
+          // Only Donchian (A) survives the rewrite; VCEB (C) history is discarded.
+          const k = 'A' as const
+          if (o.degradation?.[k] != null) st.frozenUntil[k] = Math.max(st.frozenUntil[k], o.degradation[k])
+          st.rHistory[k].push(...(o.recentTradeR?.[k] ?? []))
+          st.rHistory[k] = st.rHistory[k].slice(-12)
           st.closedR.push(...(o.rollingWindowR ?? []))
           for (const [k, v] of Object.entries(o.tradeCounters ?? {})) st.counters[k] = (st.counters[k] ?? 0) + (v as number)
           const p = o.position
           if (p) {
             const pos: Position = {
-              symbol: r.symbol, strategy: p.strategy, entryTs: p.entryTime, entryFill: p.entryFill, qty: p.qty,
+              symbol: r.symbol, strategy: 'A', entryTs: p.entryTime, entryFill: p.entryFill, qty: p.qty,
               notional: p.qty * p.entryFill + (p.entryFee ?? 0), initialStop: p.initialStop, stop: p.stop, hardStop: p.hardStop,
-              highestClose: p.highestClose, highestHigh: p.highestHigh, ratcheted: p.strategy === 'C' && p.stop > p.initialStop,
-              barsHeld: p.barsHeld, riskUsdt: p.initialRiskCash,
+              restingStop: p.hardStop ?? p.stop, stopOrderId: null, highestClose: p.highestClose, highestHigh: p.highestHigh,
+              ratcheted: p.stop > p.initialStop, barsHeld: p.barsHeld, riskUsdt: p.initialRiskCash,
+              maxUnrealizedR: 0, slip: 0.001,
             }
             st.position = pos
             st.peak = Math.max(st.peak, b.cash + pos.notional)
           }
-          if (o.pendingOrder?.type === 'EXIT' && p) st.pending = { kind: 'exit', symbol: r.symbol, strategy: p.strategy, queuedBar: o.pendingOrder.queuedBar ?? 0 }
+          if (o.pendingOrder?.type === 'EXIT' && p) st.pending = { kind: 'exit', symbol: r.symbol, strategy: 'A', queuedBar: o.pendingOrder.queuedBar ?? 0 }
           // a pending ENTRY was never filled: dropped on purpose
         }
         st.day = newDay(last != null ? barIndex(last) : 0)
@@ -67,3 +70,43 @@ function v2ToV3(db: Database) {
   const has = db.query("SELECT 1 FROM pragma_table_info('transactions') WHERE name='order_ref'").get()
   if (!has) db.exec('ALTER TABLE transactions ADD COLUMN order_ref TEXT')
 }
+
+/**
+ * v4 (Donchian-only + dynamic universe): manual asset editing is gone. Drop scheduled `edit_assets`
+ * actions and make sure every stored position has the new resting-stop fields.
+ */
+function v3ToV4(db: Database) {
+  db.transaction(() => {
+    const bots = db.query('SELECT id, pending_action FROM bots WHERE pending_action IS NOT NULL').all() as { id: string; pending_action: string }[]
+    for (const b of bots) {
+      try {
+        const list = (JSON.parse(b.pending_action) as { type: string }[]).filter((a) => a.type !== 'edit_assets')
+        db.query('UPDATE bots SET pending_action=? WHERE id=?').run(list.length ? JSON.stringify(list) : null, b.id)
+      } catch { /* malformed: leave it to the operator */ }
+    }
+    const states = db.query('SELECT bot_id, state FROM bot_state').all() as { bot_id: string; state: string }[]
+    for (const s of states) {
+      try {
+        const st = JSON.parse(s.state)
+        if (st.position) {
+          const p = st.position
+          p.slip ??= 0.001
+          p.restingStop ??= p.hardStop ?? p.stop
+          p.maxUnrealizedR ??= 0
+          p.stopOrderId ??= null
+        }
+        st.frozenUntil = { A: st.frozenUntil?.A ?? 0 }
+        st.rHistory = { A: st.rHistory?.A ?? [] }
+        if (st.day?.signals) st.day.signals = { A: st.day.signals.A ?? 0 }
+        db.query('UPDATE bot_state SET state=? WHERE bot_id=?').run(JSON.stringify(st), s.bot_id)
+      } catch { /* malformed: leave it to the operator */ }
+    }
+    db.query("INSERT OR IGNORE INTO meta(key,value) VALUES('universe_max_assets','50')").run()
+  })()
+}
+
+/**
+ * v5 (paper trading): the paper tables are created by schema.sql itself. Existing live databases are untouched:
+ * the paper account is only ever seeded/read when MODE=test opens its own copy under `data-test/`.
+ */
+function v4ToV5(_db: Database) {}

@@ -1,4 +1,4 @@
-import { test, expect, beforeAll } from 'bun:test'
+import { test, expect, beforeAll, beforeEach } from 'bun:test'
 process.env.DB_PATH = ':memory:'
 process.env.MODE = 'test'
 process.env.NO_WORKER = '1'
@@ -33,6 +33,19 @@ beforeAll(async () => {
   }
 })
 
+/** Seed the dynamic universe (the only source of a bot's asset list now). */
+function select(symbols: string[]) {
+  m.db.query('DELETE FROM universe').run()
+  const ins = m.db.query('INSERT INTO universe(symbol,selected,rank,metrics,reason,updated_at,added_at) VALUES(?,?,?,?,?,?,?)')
+  const data = (i: number) => JSON.stringify({ quoteVolume24h: 1e9 - i, bars: 500, contiguous: true, historyOk: true, lastBar: 0 })
+  symbols.forEach((s, i) => ins.run(s, 1, i + 1, data(i), '', Date.now(), Date.now()))
+}
+beforeEach(() => { for (const b of m.bots.listBots()) m.bots.deleteBot(b.id, 'now') })
+const position = (symbol: string) => ({
+  symbol, strategy: 'A', entryTs: 1, entryFill: 100, qty: 1, notional: 100, initialStop: 97, stop: 97, hardStop: 96,
+  restingStop: 96, highestClose: 100, highestHigh: 100, ratcheted: false, barsHeld: 1, riskUsdt: 3, maxUnrealizedR: 0, slip: 0.001,
+})
+
 test('indicators: ema/er/quantile/population std/prior rank', () => {
   const c = Array.from({ length: 50 }, (_, i) => 100 + i)
   expect(m.ind.efficiencyRatio(c, 20)[30]).toBeCloseTo(1)
@@ -64,16 +77,21 @@ test('cross-section: percentile rank, 0.5 for a single symbol', () => {
   expect([r.get('A'), r.get('B'), r.get('C')]).toEqual([0, 0.5, 1])
 })
 
-test('validation: replaces zod, collects issues, normalises symbols', () => {
-  expect(m.v.parseCreate({ assets: [' pepeusdt ', 'BTCUSDT'], capital: 100 }).assets).toEqual(['PEPEUSDT', 'BTCUSDT'])
-  const e = (() => { try { m.v.parseCreate({ assets: ['BTCUSDT', 'BTCUSDT', 'BTCBUSD'], capital: -1 }) } catch (x) { return x } })() as any
+test('validation: hand-written parsing, capital and universe config', () => {
+  const c = m.v.parseCreate({ name: '  my bot  ', capital: 100 })
+  expect(c.name).toBe('my bot')
+  expect(c.capital).toBe(100)
+  const e = (() => { try { m.v.parseCreate({ capital: -1 }) } catch (x) { return x } })() as any
   expect(e.status).toBe(400)
-  expect(e.issues.length).toBeGreaterThanOrEqual(3)
+  expect(e.issues.length).toBeGreaterThanOrEqual(1)
+  expect(m.v.parseUniverseConfig({ maxAssets: 25 })).toEqual({ maxAssets: 25 })
+  expect(() => m.v.parseUniverseConfig({ maxAssets: 0 })).toThrow()
   expect(m.v.parseWhen(undefined)).toBe('after_exit')
   expect(() => m.v.parseWhen('later')).toThrow()
 })
 
-test('symbols: unknown pairs are rejected, already-known ones are not re-checked', async () => {
+test('symbols: unknown pairs are rejected, valid ones accepted', async () => {
+  for (const b of m.bots.listBots()) m.bots.deleteBot(b.id, 'now') // other test files may share the process
   const calls: string[][] = []
   m.sym.setSymbolValidator(async (s: string[]) => { calls.push(s); return s.map((x) => ({ symbol: x, ok: x !== 'FAKEUSDT', reason: 'unknown Binance symbol' })) })
   await expect(m.sym.assertTradable(['FAKEUSDT'])).rejects.toMatchObject({ status: 400 })
@@ -82,8 +100,10 @@ test('symbols: unknown pairs are rejected, already-known ones are not re-checked
 })
 
 test('any asset: buys the breakout, logs strategy + notifications, idempotent, rolling window constant', () => {
-  const bot = m.bots.createBot({ name: 't', assets: ['PEPEUSDT'], capital: 1000 })
-  const cs = candles(420, 330)
+  select(['PEPEUSDT'])
+  const bot = m.bots.createBot({ name: 't', capital: 1000 })
+  expect(bot.assets).toEqual(['PEPEUSDT'])
+  const cs = candles(520, 470)
   m.runner.upsertCandles('PEPEUSDT', cs.slice(0, 251))
   // pretend the bot was live since bar 250 and let time pass bar by bar (live mode never replays history)
   const { st } = m.bots.loadState(bot.id)
@@ -96,7 +116,7 @@ test('any asset: buys the breakout, logs strategy + notifications, idempotent, r
   const buys = txs.filter((t) => t.action === 'BUY'), sells = txs.filter((t) => t.action === 'SELL')
   expect(buys.length).toBeGreaterThan(0)
   expect(sells.length).toBeGreaterThan(0)
-  expect(['A', 'C']).toContain(buys[0].strategy)
+  expect(buys[0].strategy).toBe('A')
   expect(sells[0].exit_reason).toBeTruthy()
   const v = m.bots.botView(m.bots.getBot(bot.id))
   if (!v.position) expect(v.cash).toBeCloseTo(txs[txs.length - 1].cash_after, 6)
@@ -113,18 +133,22 @@ test('any asset: buys the breakout, logs strategy + notifications, idempotent, r
 })
 
 test('data pulling: only assets an active bot listens to; a bot in a trade needs only its asset', () => {
+  for (const b of m.bots.listBots()) m.bots.deleteBot(b.id, 'now')
+  select(['AAAUSDT', 'BBBUSDT'])
   expect(m.bots.neededSymbols()).toEqual([])
-  const a = m.bots.createBot({ name: 'a', assets: ['AAAUSDT', 'BBBUSDT'], capital: 500 })
+  const a = m.bots.createBot({ name: 'a', capital: 500 })
   expect(m.bots.neededSymbols()).toEqual(['AAAUSDT', 'BBBUSDT'])
-  const b = m.bots.createBot({ name: 'b', assets: ['BBBUSDT', 'CCCUSDT'], capital: 500, active: false })
-  expect(m.bots.neededSymbols()).toEqual(['AAAUSDT', 'BBBUSDT']) // inactive bot -> CCC not pulled
+  const b = m.bots.createBot({ name: 'b', capital: 500, active: false })
+  b.assets = ['BBBUSDT', 'CCCUSDT']; m.bots.saveBot(b) // an inactive bot never contributes
+  expect(m.bots.neededSymbols()).toEqual(['AAAUSDT', 'BBBUSDT'])
   // bot a enters AAA: BBB is no longer pulled for it (nobody else listens to BBB)
   const { st, last } = m.bots.loadState(a.id)
-  st.position = { symbol: 'AAAUSDT', strategy: 'A', entryTs: 1, entryFill: 100, qty: 1, notional: 100, initialStop: 97, stop: 97, hardStop: 96, highestClose: 100, highestHigh: 100, ratcheted: false, barsHeld: 1, riskUsdt: 3 }
+  st.position = position('AAAUSDT')
   m.bots.saveState(a.id, st, last)
   expect(m.bots.neededSymbols()).toEqual(['AAAUSDT'])
   // another active bot that also listens to BBB brings it back
-  const c = m.bots.createBot({ name: 'c', assets: ['BBBUSDT'], capital: 500 })
+  const c = m.bots.createBot({ name: 'c', capital: 500 })
+  c.assets = ['BBBUSDT']; m.bots.saveBot(c)
   expect(m.bots.neededSymbols()).toEqual(['AAAUSDT', 'BBBUSDT'])
   m.bots.deleteBot(c.id, 'now')
   // exit -> BBB pulled again
@@ -139,9 +163,10 @@ test('data pulling: only assets an active bot listens to; a bot in a trade needs
 })
 
 test('lifecycle: after_exit waits for the trade, delete removes every footprint', () => {
-  const bot = m.bots.createBot({ name: 'w', assets: ['ETHUSDT', 'SOLUSDT'], capital: 500 })
+  select(['ETHUSDT', 'SOLUSDT'])
+  const bot = m.bots.createBot({ name: 'w', capital: 500 })
   const { st, last } = m.bots.loadState(bot.id)
-  st.position = { symbol: 'ETHUSDT', strategy: 'A', entryTs: 1, entryFill: 100, qty: 1, notional: 100, initialStop: 97, stop: 97, hardStop: 96, highestClose: 100, highestHigh: 100, ratcheted: false, barsHeld: 1, riskUsdt: 3 }
+  st.position = position('ETHUSDT')
   m.bots.saveState(bot.id, st, last)
   expect(m.bots.deleteBot(bot.id, 'after_exit')).toBe('scheduled')
   expect(m.bots.getBot(bot.id)).not.toBeNull()
@@ -157,7 +182,8 @@ test('lifecycle: after_exit waits for the trade, delete removes every footprint'
 test('daily summary: built after the 20:00 bar, resets the day accumulator', async () => {
   const { buildDailySummary } = await import('../src/summary')
   const { newBotState } = await import('../src/engine')
-  const bot = m.bots.createBot({ name: 'd', assets: ['DDDUSDT'], capital: 100 })
+  select(['DDDUSDT'])
+  const bot = m.bots.createBot({ name: 'd', capital: 100 })
   const cs = candles(30, 99)
   m.runner.upsertCandles('DDDUSDT', cs)
   const S = m.runner.loadSeries('DDDUSDT')
@@ -169,18 +195,21 @@ test('daily summary: built after the 20:00 bar, resets the day accumulator', asy
   expect(text).toContain('DAILY SUMMARY')
   expect(text).toContain('08:00 BUY X')
   expect(text).toContain('cooldown 2')
+  expect(text).toContain('Universe filter')
+  expect(text).toContain('selected 1/50')
+  expect(text).toContain('full asset list on the dashboard')
   expect(text).toContain('Market (24h)')
   expect(st.day.lines.length).toBe(0)
   m.bots.deleteBot(bot.id, 'now')
 })
 
-test('blocked trades: cooldown, score filter and C quality gate are reported once, with strategy names', async () => {
+test('blocked trades: cooldown and the score filter are reported once, with strategy names', async () => {
   const { stepBot, newBotState } = await import('../src/engine')
   const { newFx } = await import('../src/types')
   const row = (symbol: string, o: any = {}) => ({
-    symbol, t: END, open: 100, high: 105, low: 99, close: 104, volume: 500, ema200: 90, atr14: 2, donchian40: 102, donchian10: 100,
-    volRatio: 1.3, cBbWidth: 0.02, cWidthThreshold: 0.03, persistenceEr: 0.2, relReturn: 0.1, atrPctPctl: 0.5, volumeUsdMedian: 1e6,
-    dataOk: true, signalA: false, signalC: false, rawC: false, ...o,
+    symbol, t: END, open: 100, high: 105, low: 99, close: 104, volume: 500, ema200: 90, atr14: 2, donchian40: 102,
+    volRatio: 1.3, persistenceEr: 0.2, relReturn: 0.1, atrPctPctl: 0.5, volumeUsdMedian: 1e6,
+    dataOk: true, signalA: false, ...o,
   })
   const bot: any = { id: 'bb', name: 'blk', assets: ['XUSDT'], initial_capital: 1000, cash: 1000, status: 'active', pending_action: [] }
   // 1. cooldown blocks a Donchian signal
@@ -201,12 +230,7 @@ test('blocked trades: cooldown, score filter and C quality gate are reported onc
   stepBot(bot, st, new Map([['XUSDT', row('XUSDT', { signalA: true, persistenceEr: 0.1, volRatio: 1.25 })]]), END, fx, { now: Date.now(), fresh: true })
   expect(st.pending).toBeNull()
   expect(fx.notes[0].text).toContain('score below regime minimum')
-  // 3. raw VCEB setup rejected by the locked quality gates
-  st = newBotState(1000); fx = newFx()
-  stepBot(bot, st, new Map([['XUSDT', row('XUSDT', { rawC: true, signalC: false })]]), END, fx, { now: Date.now(), fresh: true })
-  expect(fx.notes[0].text).toContain('VCEB (C)')
-  expect(fx.notes[0].text).toContain('C quality gate')
-  // 4. a strong signal queues an entry and names the strategy
+  // 3. a strong signal queues an entry and names the strategy
   st = newBotState(1000); fx = newFx()
   stepBot(bot, st, new Map([['XUSDT', row('XUSDT', { signalA: true, persistenceEr: 1, volRatio: 3, close: 106 })]]), END, fx, { now: Date.now(), fresh: true })
   expect(st.pending?.strategy).toBe('A')

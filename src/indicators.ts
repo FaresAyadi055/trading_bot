@@ -12,7 +12,7 @@ export function ewm(x: number[], alpha: number, minPeriods: number): number[] {
   }
   return out
 }
-export const ema = (x: number[], n: number) => ewm(x, 2 / (n + 1), n)
+export const ema = (x: number[], n: number, minPeriods = n) => ewm(x, 2 / (n + 1), minPeriods)
 
 /** Wilder ATR: RMA(true range, n), seeded at the first TR (first bar uses H-L). */
 export function atr(h: number[], l: number[], c: number[], n: number): number[] {
@@ -20,13 +20,21 @@ export function atr(h: number[], l: number[], c: number[], n: number): number[] 
   return ewm(tr, 1 / n, n)
 }
 
-/** max(high[i-n..i-1]); current bar excluded. */
+/** max(high[i-n..i-1]); current bar excluded. Monotonic deque: O(n), important on a Pi Zero. */
 export function donchian(h: number[], n: number): number[] {
   const out = nanArr(h.length)
-  for (let i = n; i < h.length; i++) {
-    let m = -Infinity
-    for (let j = i - n; j < i; j++) if (h[j]! > m) m = h[j]!
-    out[i] = m
+  const dq: number[] = []
+  let head = 0
+  for (let i = 0; i < h.length; i++) {
+    const add = i - 1
+    if (add >= 0) {
+      while (dq.length > head && h[dq[dq.length - 1]!]! <= h[add]!) dq.pop()
+      dq.push(add)
+    }
+    while (dq.length > head && dq[head]! < i - n) head++
+    if (i >= n) out[i] = h[dq[head]!]!
+    // compact the deque occasionally so the head index cannot grow without bound
+    if (head > 256 && head * 2 > dq.length) { dq.splice(0, head); head = 0 }
   }
   return out
 }
@@ -63,6 +71,12 @@ export function quantile(w: number[], q: number): number {
   const lo = Math.floor(pos)
   const hi = Math.ceil(pos)
   return s[lo]! + (s[hi]! - s[lo]!) * (pos - lo)
+}
+
+/** Median of a finite array (NaN when empty). */
+export function median(x: number[]): number {
+  const w = x.filter(Number.isFinite)
+  return w.length ? quantile(w, 0.5) : NaN
 }
 
 /** Rolling quantile over the window ending at i (inclusive); NaN unless the full window is finite. */

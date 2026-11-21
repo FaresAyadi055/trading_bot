@@ -5,7 +5,6 @@ process.env.NO_WORKER = '1'
 process.env.ACCESS_TOKEN = 'test-token'
 process.env.TELEGRAM_BOT_TOKEN = 'x'
 process.env.TELEGRAM_CHAT_ID = '1'
-process.env.INTERRUPT_MIN_SECONDS = '120'
 
 const BAR = 4 * 3600_000
 let m: any
@@ -17,21 +16,24 @@ beforeAll(async () => {
   exch.setExchange(ex)
   m = {
     bots: await import('../src/bots'), live: await import('../src/live'), cap: await import('../src/capital'), rt: (await import('../src/runtime')).rt,
-    db: (await import('../src/db')).db, runner: await import('../src/runner'), intr: await import('../src/interrupt'), engine: await import('../src/engine'),
+    db: (await import('../src/db')).db, runner: await import('../src/runner'), engine: await import('../src/engine'),
     time: await import('../src/time'),
   }
-  m.intr.probeOpts.data = false // the heartbeat probes only the mock exchange
   m.rt.live = true // live execution + capital enforcement (index.ts does this at boot)
 })
 beforeEach(() => {
   m.db.query('DELETE FROM bots').run()
   m.db.query('DELETE FROM notifications').run()
-  ex.free = { USDT: 1000 }; ex.calls = []; ex.failNext = []; ex.offline = false
+  ex.free = { USDT: 1000 }; ex.calls = []; ex.failNext = []
   ex.price = { BTCUSDT: 100, ETHUSDT: 50 }
   m.cap.resetCapitalCache()
 })
 
-const create = async (capital: number, assets = ['BTCUSDT']) => m.bots.createBot({ name: 't', assets, capital }, await m.cap.fetchFree())
+const create = async (capital: number, assets = ['BTCUSDT']) => {
+  const b = m.bots.createBot({ name: 't', capital }, await m.cap.fetchFree())
+  b.assets = assets; m.bots.saveBot(b) // bypass the dynamic universe: these tests drive the execution layer directly
+  return b
+}
 /** 5s after the open of the current bar: the moment a live entry decided on the previous bar is executed. */
 const T = () => m.time.barOpen(Date.now()) + 5000
 const pendingEntry = (id: string, symbol = 'BTCUSDT') => {
@@ -151,16 +153,17 @@ test('live failure: rejected BUY / SELL queue a Telegram alert with the Binance 
   expect(m.bots.loadState(sellBot.id).st.position).not.toBeNull()                // the position is kept until the retry succeeds
 })
 
-test('stop monitor: C stop and hard stop sell at market and book real P/L; other bots untouched', async () => {
+test('stop monitor: resting hard stop fills on the exchange and books real P/L; other bots untouched', async () => {
   const bot = await create(1000)
   pendingEntry(bot.id)
   await m.live.executeBot(bot.id, T())
   const { st } = m.bots.loadState(bot.id)
   expect(st.position.strategy).toBe('A')
-  ex.price.BTCUSDT = st.position.stop - 0.01                                    // below A's close-based trail: NOT a stop for A
+  expect(st.position.stopOrderId).toBeTruthy()                                  // the stop rests on Binance
+  ex.price.BTCUSDT = st.position.stop - 0.01                                    // above the resting hard stop: no trigger
   await m.live.monitorTick(T())
   expect(m.bots.loadState(bot.id).st.position).not.toBeNull()
-  ex.price.BTCUSDT = st.position.hardStop - 0.5                                 // hard stop breached
+  ex.price.BTCUSDT = st.position.hardStop - 0.5                                 // hard stop breached -> exchange stop fills
   await m.live.monitorTick(T())
   const after = m.bots.loadState(bot.id)
   expect(after.st.position).toBeNull()
@@ -200,48 +203,35 @@ test('closeBotNow sells for real; forceClose refuses to fake a live sale', async
   expect(m.bots.deactivate(bot.id, 'now').status).toBe('inactive')
 })
 
-test('interrupt: no replay — stale bars are skipped, time-based state advances, one alert is queued', async () => {
+test('no replay: stale bars are skipped, time-based state advances, nothing is traded', async () => {
   const bot = await create(500)
   const now = Date.now()
   const lastClosed = m.time.lastClosedBar(now)
   const { st } = m.bots.loadState(bot.id)
-  st.position = { symbol: 'BTCUSDT', strategy: 'A', entryTs: 1, entryFill: 100, qty: 1, notional: 100, initialStop: 97, stop: 97, hardStop: 96, highestClose: 100, highestHigh: 100, ratcheted: false, barsHeld: 5, riskUsdt: 3 }
+  st.position = { symbol: 'BTCUSDT', strategy: 'A', entryTs: 1, entryFill: 100, qty: 1, notional: 100, initialStop: 97, stop: 97, hardStop: 96, restingStop: 96, highestClose: 100, highestHigh: 100, ratcheted: false, barsHeld: 5, riskUsdt: 3, maxUnrealizedR: 0, slip: 0.001 }
   st.cooldown = 10
   m.bots.saveState(bot.id, st, lastClosed - 10 * BAR)                           // 10 bars behind
   ex.free.BTC = 1
-  const text = await m.intr.handleReconnect(now - 3 * 3600_000, now)
+  const skipped = m.runner.skipStaleBars(bot.id, now)
   const after = m.bots.loadState(bot.id)
   const fresh = now - (lastClosed + BAR) <= m.time.LIVE_BAR_MAX_AGE_MS
-  const skipped = fresh ? 9 : 10
-  expect(after.st.counters.skipped_bars).toBe(skipped)
-  expect(after.st.position.barsHeld).toBe(5 + skipped)
+  const expected = fresh ? 9 : 10
+  expect(skipped).toBe(expected)
+  expect(after.st.counters.skipped_bars).toBe(expected)
+  expect(after.st.position.barsHeld).toBe(5 + expected)
   expect(after.st.cooldown).toBe(0)
   expect(after.last).toBe(lastClosed - (fresh ? BAR : 0))
-  expect(text).toContain('CONNECTION INTERRUPTED'); expect(text).toContain('NOT evaluated'); expect(text).toContain('HOLDING BTCUSDT')
-  expect(text).toContain('3h')
-  const n = m.db.query("SELECT * FROM notifications WHERE kind='interrupt'").all() as any[]
-  expect(n.length).toBe(1)
+  expect((m.db.query("SELECT COUNT(*) c FROM notifications WHERE kind IN ('interrupt','api_error')").get() as any).c).toBe(0) // no connectivity alert
   expect(m.db.query("SELECT COUNT(*) c FROM transactions WHERE bot_id=?").get(bot.id)).toEqual({ c: 0 }) // nothing was traded by the skipped bars
 })
 
-test('interrupt: heartbeat detects the gap only after reconnect, once', async () => {
-  await create(100)
-  const calls: string[] = []
-  const hooks = { onReconnect: () => { calls.push('reconnect') }, afterAlert: () => { calls.push('after') } }
-  m.intr._setLastOk(Date.now() - 10 * 60_000)
-  ex.offline = true
-  await m.intr._tick(hooks)                                                    // still offline: nothing
-  expect(calls).toEqual([])
-  expect((m.db.query("SELECT COUNT(*) c FROM notifications WHERE kind='interrupt'").get() as any).c).toBe(0)
-  ex.offline = false
-  await m.intr._tick(hooks)                                                    // back: one alert
-  expect(calls).toEqual(['reconnect', 'after'])
-  expect((m.db.query("SELECT COUNT(*) c FROM notifications WHERE kind='interrupt'").get() as any).c).toBe(1)
-  await m.intr._tick(hooks)                                                    // next probe: no second alert
-  expect((m.db.query("SELECT COUNT(*) c FROM notifications WHERE kind='interrupt'").get() as any).c).toBe(1)
-  m.intr._setLastOk(Date.now() - 30_000)                                        // short blip < threshold: silent
-  await m.intr._tick(hooks)
-  expect((m.db.query("SELECT COUNT(*) c FROM notifications WHERE kind='interrupt'").get() as any).c).toBe(1)
+test('telegram: only failed functional API requests are queued, rate-limited per key', async () => {
+  const { notifyApiFailure } = await import('../src/notify')
+  notifyApiFailure('test:candles', 'msg one')
+  notifyApiFailure('test:candles', 'msg two') // same key inside the window: dropped
+  notifyApiFailure('test:universe', 'msg three')
+  const rows = m.db.query("SELECT text FROM notifications WHERE kind='api_error' ORDER BY id").all() as any[]
+  expect(rows.map((r) => r.text)).toEqual(['msg one', 'msg three'])
 })
 
 afterAll(() => { m.rt.live = false })
@@ -262,7 +252,7 @@ function series(n: number, crashAt: number) {
 
 test('pipeline: engine decides bar by bar, real orders are placed at the open, books == exchange, no simulated fills', async () => {
   const bot = await create(1000, ['PEPEUSDT'])
-  const cs = series(420, 330)
+  const cs = series(520, 470)
   m.runner.upsertCandles('PEPEUSDT', cs.slice(0, 251))
   const { st: s0 } = m.bots.loadState(bot.id)
   m.bots.saveState(bot.id, s0, cs[250].t)

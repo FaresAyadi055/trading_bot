@@ -45,15 +45,14 @@ dialog{max-width:520px}
 <dialog id="dlg"></dialog>
 <script>
 'use strict';
-const SN={A:'Donchian',C:'VCEB'};
-let symList=null,symErr='';
+const SN={A:'Donchian'};
 const $=(s)=>document.querySelector(s);
 const esc=(s)=>String(s??'').replace(/[&<>"']/g,(c)=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt=(n,d=2)=>n==null||!isFinite(n)?'–':Number(n).toLocaleString('en-US',{maximumFractionDigits:d,minimumFractionDigits:d});
 const cls=(n)=>n>0?'up':n<0?'dn':'';
 const sgn=(n,d=2)=>(n>0?'+':'')+fmt(n,d);
 let token=localStorage.getItem('tb_token')||'';
-let bots=[],status=null,capital=null,capErr='',prices={},open=new Set(),details={};
+let bots=[],status=null,capital=null,universe=null,capErr='',prices={},open=new Set(),details={};
 const timeAgo=(ms)=>{if(!ms)return 'never';const s=Math.round((Date.now()-ms)/1000);return s<90?s+'s ago':s<5400?Math.round(s/60)+'m ago':Math.round(s/3600)+'h ago'};
 
 async function api(method,path,body){
@@ -76,20 +75,11 @@ async function loadPrices(){
     for(const x of await r.json())prices[x.symbol]=+x.price;
   }catch{}
 }
-// Asset list for the picker: every USDT pair of the Binance API, most liquid first (fetched by the browser, never via Hono).
-async function loadSymbols(){
-  if(symList&&Date.now()-symList.at<300000)return symList.rows;
-  try{
-    const r=await fetch(BASE()+'/api/v3/ticker/24hr?type=MINI');
-    if(!r.ok)throw new Error('HTTP '+r.status);
-    const rows=(await r.json()).filter(x=>x.symbol.endsWith('USDT')&&+x.quoteVolume>0).map(x=>({s:x.symbol,b:x.symbol.slice(0,-4),p:+x.lastPrice,chg:+x.openPrice?(+x.lastPrice/+x.openPrice-1)*100:0,qv:+x.quoteVolume})).sort((a,b)=>b.qv-a.qv);
-    symList={rows,at:Date.now()};symErr='';return rows;
-  }catch(e){symErr='Could not load the Binance asset list ('+e.message+'). Type a symbol such as SOLUSDT and press Enter.';return symList?.rows||[]}
-}
 async function refresh(){
   if(!token)return;
   try{
     [bots,status]=await Promise.all([api('GET','/bots'),api('GET','/status')]);
+    try{universe=await api('GET','/universe')}catch(e){if(e.message==='unauthorized')throw e;universe=null}
     await loadPrices();
     try{capital=await api('GET','/capital');capErr=''}catch(e){if(e.message==='unauthorized')throw e;capital=null;capErr=e.message}
     for(const id of open){details[id]=await api('GET','/bots/'+id+'/transactions?limit=500')}
@@ -121,8 +111,8 @@ function capitalPanel(){
   if(!capital)return `<div class="card"><strong>Capital</strong><div class="alert">Account balance unavailable: ${esc(capErr||'loading…')}. New bots, capital increases and activations are refused until it can be read.</div></div>`;
   const c=capital,tot=Math.max(c.actualCapital,c.allocated,1e-9);
   const pPos=c.inPositions/tot*100,pCash=Math.min(c.botCash/tot*100,100-pPos),pFree=Math.max(0,100-pPos-pCash);
-  return `<div class="card"><div class="row" style="justify-content:space-between"><strong>Capital · account vs bot allocations</strong>
-    <span class="mut">${esc(c.exchange)} · ${c.cached?'cached':'fresh'} ${timeAgo(c.at)} · <a href="#" data-act="capital-refresh">refresh</a></span></div>
+  return `<div class="card"><div class="row" style="justify-content:space-between"><strong>Capital · ${c.mode==='test'?'paper account vs bot allocations':'account vs bot allocations'}</strong>
+    <div class="row"><span class="mut">${esc(c.exchange)} · ${c.cached?'cached':'fresh'} ${timeAgo(c.at)} · <a href="#" data-act="capital-refresh">refresh</a></span>${c.mode==='test'?'<button class="pri" data-act="paper-capital">+ Add test capital</button>':''}</div></div>
     <div class="grid" style="margin-top:8px">
       <div><div class="k">Actual capital (account)</div><div class="v">${fmt(c.actualCapital)}</div></div>
       <div><div class="k">Allocated to bots</div><div class="v">${fmt(c.allocated)} <span class="mut" style="font-size:12px">${fmt(c.allocatedPct,1)}%</span></div></div>
@@ -139,6 +129,17 @@ function capitalPanel(){
   </div>`;
 }
 const room=()=>capital?` <span class="mut">(unallocated: ${fmt(Math.max(0,capital.unallocated))} USDT)</span>`:'';
+function universePanel(){
+  const u=universe,s=status?.universe;
+  if(!u)return `<div class="card"><strong>Dynamic universe</strong><div class="alert">Universe unavailable: ${esc(s?.error||'loading…')}</div></div>`;
+  const sel=u.selected||[],rows=(u.rows||[]).filter(r=>r.selected);
+  const progress=s?.progress&&s.progress!=='done'?` · scan ${esc(s.progress)}`:'';
+  return `<div class="card"><div class="row" style="justify-content:space-between"><strong>Dynamic universe</strong>
+    <span class="mut">${sel.length} / ${u.maxAssets} selected · ${u.candidates} candidates · refreshed ${timeAgo(u.updatedAt)}${progress} · <a href="#" data-act="universe-refresh">refresh now</a></span></div>
+    <div class="sel">${sel.map(x=>`<span class="badge" title="${esc(rows.find(r=>r.symbol===x)?.reason||'')}">${esc(x.replace('USDT',''))}</span>`).join('')||'<span class="mut">No asset passes the filters yet — a scan runs every 24h (6 closed 4h bars).</span>'}</div>
+    <div class="row" style="margin-top:6px"><label style="margin:0">Max assets</label><input id="umax" type="number" min="1" max="500" step="1" value="${u.maxAssets}" style="width:90px"><button data-act="universe-save">Save</button>${s?.error?`<span class="dn" style="font-size:12px">${esc(s.error)}</span>`:''}</div>
+  </div>`;
+}
 function botCard(b){
   const eq=mark(b),pnl=eq-b.initialCapital,pct=pnl/b.initialCapital*100;
   const p=b.position,u=p?(prices[p.symbol]??b.lastPrice??p.entryFill)*p.qty-p.entryFill*p.qty:0;
@@ -158,8 +159,8 @@ function botCard(b){
     </div>
     <div class="k" style="margin-top:12px">Equity curve (USDT, per closed trade, last point marked live)</div>${spark(s.curve)}
     <div class="k" style="margin:10px 0 4px">Regime &amp; account protections</div>
-    <div class="scroll"><table><tr><th>Regime</th><th>Min score</th><th>Risk x</th><th>Cooldown</th><th>Paused</th><th>Loss streak</th><th>7d R</th><th>Drawdown</th><th>Frozen</th><th>Signals A/C</th><th>Blocked</th></tr>
-    <tr><td>${b.account.regime}</td><td>${fmt(b.account.minScore)}</td><td>${fmt(b.account.riskMult)}</td><td>${b.account.cooldownLeft}</td><td>${b.account.paused?'yes':'no'}</td><td>${b.account.consecutiveLosses}</td><td>${fmt(b.account.weekR)}</td><td>${fmt(b.account.drawdownPct*100,1)}%</td><td>${['A','C'].filter(k=>b.account.frozen[k]).map(k=>SN[k]).join(', ')||'–'}</td><td>${b.counters.executedA||0}A/${b.counters.executedC||0}C trades</td><td>${Object.entries(b.counters).filter(([k])=>k.startsWith('blocked_')).reduce((a,[,v])=>a+v,0)}</td></tr></table></div>
+    <div class="scroll"><table><tr><th>Regime</th><th>Min score</th><th>Risk x</th><th>Cooldown</th><th>Paused</th><th>Loss streak</th><th>7d R</th><th>Drawdown</th><th>Frozen</th><th>Signals A</th><th>Blocked</th></tr>
+    <tr><td>${b.account.regime}</td><td>${fmt(b.account.minScore)}</td><td>${fmt(b.account.riskMult)}</td><td>${b.account.cooldownLeft}</td><td>${b.account.paused?'yes':'no'}</td><td>${b.account.consecutiveLosses}</td><td>${fmt(b.account.weekR)}</td><td>${fmt(b.account.drawdownPct*100,1)}%</td><td>${b.account.frozen.A?'Donchian':'–'}</td><td>${b.counters.executedA||0} trades</td><td>${Object.entries(b.counters).filter(([k])=>k.startsWith('blocked_')).reduce((a,[,v])=>a+v,0)}</td></tr></table></div>
     <div class="k" style="margin-top:6px">Data pulled for this bot: ${b.tracking.pulled.length?esc(b.tracking.pulled.slice(0,12).join(', '))+(b.tracking.pulled.length>12?'…':''):'–'}${b.tracking.paused.length?` · paused while in a trade: ${b.tracking.paused.length}`:''}</div>
     <div class="k" style="margin:10px 0 4px">Transaction log</div>
     <div class="scroll"><table><tr><th>Time</th><th>Asset</th><th>Side</th><th>Strat</th><th>Price</th><th>Qty</th><th>P/L USDT</th><th>P/L %</th><th>R</th><th>Exit</th><th>Cash</th></tr>
@@ -196,7 +197,7 @@ function render(){
     return;
   }
   const tot=bots.reduce((a,b)=>a+mark(b),0),cap=bots.reduce((a,b)=>a+b.initialCapital,0);
-  el.innerHTML=`<header><h1>Trading bot <span class="badge ${status?.mode==='live'?'live':'test'}" title="${status?.mode==='live'?'real funds via Binance Convert':'Binance spot testnet (no real funds)'}">${status?status.mode.toUpperCase():'…'}</span></h1>
+  el.innerHTML=`<header><h1>Trading bot <span class="badge ${status?.mode==='live'?'live':'test'}" title="${status?.mode==='live'?'real funds on Binance spot':'paper trading: real prices, simulated fills, no real funds'}">${status?status.mode.toUpperCase():'…'}</span></h1>
     <div class="row mut"><span>${[...new Set(bots.filter(b=>b.position).map(b=>b.position.symbol))].map(s=>`${s.replace('USDT','')} ${fmt(prices[s],prices[s]>=100?2:prices[s]>=1?4:8)}`).join(' · ')}</span></div>
     <div class="row"><button class="pri" data-act="create">+ New bot</button><button data-act="logout">Sign out</button></div></header>
   <main>
@@ -208,34 +209,16 @@ function render(){
         <div><div class="k">Total P/L</div><div class="v ${cls(tot-cap)}">${sgn(tot-cap)}</div></div>
         <div><div class="k">Next 4h candle</div><div class="v" style="font-size:14px">${status?new Date(status.nextBarAt).toLocaleTimeString():'–'}</div></div>
         <div><div class="k">Last data cycle</div><div class="v" style="font-size:14px">${timeAgo(status?.workerLastCycle)}</div></div>
-        <div><div class="k">Last heartbeat</div><div class="v" style="font-size:14px" title="an outage longer than the interrupt threshold triggers a Telegram alert after reconnect">${timeAgo(status?.heartbeatAt)}</div></div>
         <div><div class="k">Telegram</div><div class="v" style="font-size:14px">${status?.telegram?'on':'off'}</div></div>
         <div><div class="k">Assets pulled / tracked</div><div class="v" style="font-size:14px" title="pulled: ${esc((status?.symbolsPulled||[]).join(', '))}">${status?.symbolsPulled?.length??0} / ${status?.symbolsTracked?.length??0}</div></div>
       </div>${status?.workerError?`<div class="dn" style="margin-top:8px;font-size:12px">Last data error: ${esc(status.workerError)}</div>`:''}
     </div>
+    ${universePanel()}
     ${capitalPanel()}
     ${bots.map(botCard).join('')||'<div class="card mut">No bots yet. Create one to start trading.</div>'}
   </main>`;
 }
 const dlg=$('#dlg');
-let pick=new Set();
-const assetPicker=()=>`<div id="ap"><div class="sel" id="ap-sel"></div><input id="ap-q" placeholder="Search Binance assets (e.g. SOL, PEPE)…" autocomplete="off" style="width:100%"><div class="aplist" id="ap-list"></div><div id="ap-err" class="dn" style="font-size:12px;margin-top:4px"></div></div>`;
-const picked=()=>[...pick];
-function drawPicker(rows){
-  const q=dlg.querySelector('#ap-q').value.trim().toUpperCase().replace(/USDT$/,'');
-  dlg.querySelector('#ap-sel').innerHTML=[...pick].map(s=>`<span class="chip">${esc(s.replace(/USDT$/,''))}<button type="button" data-pk="${esc(s)}" title="remove">✕</button></span>`).join('')||'<span class="mut">No asset selected</span>';
-  const hit=(q?rows.filter(r=>r.b.includes(q)).sort((a,b)=>(b.b===q)-(a.b===q)||(b.b.startsWith(q)-a.b.startsWith(q))||b.qv-a.qv):rows).slice(0,60);
-  dlg.querySelector('#ap-list').innerHTML=hit.map(r=>`<div data-pk="${r.s}" class="${pick.has(r.s)?'picked':''}"><span>${pick.has(r.s)?'✓ ':''}${esc(r.b)}<small>/USDT</small></span><small>${fmt(r.p,r.p>=100?2:r.p>=1?4:8)} · <span class="${cls(r.chg)}">${sgn(r.chg,1)}%</span> · vol ${r.qv>=1e9?fmt(r.qv/1e9,2)+'B':r.qv>=1e6?fmt(r.qv/1e6,1)+'M':fmt(r.qv/1e3,0)+'K'}</small></div>`).join('')||`<div class="mut">${rows.length?'No match':'Asset list unavailable'}${q?' — press Enter to add '+esc(q)+'USDT':''}</div>`;
-  dlg.querySelector('#ap-err').textContent=symErr;
-}
-async function initPicker(sel){
-  pick=new Set(sel);
-  const rows=await loadSymbols(),q=dlg.querySelector('#ap-q'),toggle=(s)=>{pick.has(s)?pick.delete(s):pick.add(s);drawPicker(rows)};
-  drawPicker(rows);q.focus();
-  q.oninput=()=>drawPicker(rows);
-  q.onkeydown=(e)=>{if(e.key!=='Enter')return;e.preventDefault();const t=q.value.trim().toUpperCase();if(!t)return;const s=t.endsWith('USDT')?t:t+'USDT';pick.add(s);q.value='';drawPicker(rows)};
-  dlg.querySelector('#ap').onclick=(e)=>{const t=e.target.closest('[data-pk]');if(!t)return;e.preventDefault();e.stopPropagation();toggle(t.dataset.pk)};
-}
 function modal(html,onOk,okText='Save',after){
   dlg.innerHTML=`<form method="dialog">${html}<div class="row" style="margin-top:16px;justify-content:flex-end"><button value="x" formnovalidate>Cancel</button><button class="pri" id="ok" value="y">${okText}</button></div><div id="merr" class="dn" style="margin-top:8px"></div></form>`;
   dlg.showModal();if(after)after();
@@ -250,16 +233,20 @@ document.addEventListener('click',async(e)=>{
   const {act,id,type}=t.dataset,b=bots.find(x=>x.id===id);
   try{
     if(act==='logout'){localStorage.removeItem('tb_token');token='';render()}
-    else if(act==='create')modal(`<h3 style="margin-top:0">New bot</h3><label>Name (optional)</label><input id="n" style="width:100%"><label>Trading assets — any Binance USDT pair (one trade at a time, best signal across them wins)</label>${assetPicker()}<label>Capital (USDT)${room()}</label><input id="c" type="number" min="1" step="0.01" inputmode="decimal" value="1000" style="width:100%">`,
-      ()=>api('POST','/bots',{name:dlg.querySelector('#n').value||undefined,assets:picked(),capital:+dlg.querySelector('#c').value}),'Create',()=>initPicker(['BTCUSDT']));
+    else if(act==='create')modal(`<h3 style="margin-top:0">New bot</h3><label>Name (optional)</label><input id="n" style="width:100%"><label>Trading universe — the dynamic filter selects ${universe?.selected?.length??0} asset(s) right now; the bot follows it automatically (one trade at a time, best signal wins)</label><label>Capital (USDT)${room()}</label><input id="c" type="number" min="1" step="0.01" inputmode="decimal" value="1000" style="width:100%">`,
+      ()=>api('POST','/bots',{name:dlg.querySelector('#n').value||undefined,capital:+dlg.querySelector('#c').value}),'Create');
     else if(act==='activate'){await api('POST','/bots/'+id+'/activate');refresh()}
     else if(act==='deactivate')modal(`<h3 style="margin-top:0">Deactivate ${esc(b.name)}</h3><label>When</label><select id="w" style="width:100%"><option value="after_exit">After the current trade exits${b.position?'':' (flat → immediate)'}</option><option value="now">Now (closes any open position at market)</option></select>`,
       ()=>api('POST','/bots/'+id+'/deactivate',{when:dlg.querySelector('#w').value}),'Deactivate');
-    else if(act==='edit')modal(`<h3 style="margin-top:0">Edit ${esc(b.name)}</h3><label>Name</label><input id="n" value="${esc(b.name)}" style="width:100%"><label>Trading assets</label>${assetPicker()}<label>If the open trade's asset is removed</label><select id="w" style="width:100%"><option value="after_exit">Wait for the trade to exit</option><option value="now">Close it now</option></select><label>Capital base (USDT) — applied when flat; an increase must fit the unallocated capital${room()}</label><input id="c" type="number" min="1" step="0.01" inputmode="decimal" value="${b.initialCapital}" style="width:100%">`,
-      ()=>{const body={name:dlg.querySelector('#n').value,when:dlg.querySelector('#w').value};const a=picked();if(a.join()!==b.assets.join())body.assets=a;const c=+dlg.querySelector('#c').value;if(c!==b.initialCapital)body.capital=c;return api('PATCH','/bots/'+id,body)},'Save',()=>initPicker(b.assets));
+    else if(act==='edit')modal(`<h3 style="margin-top:0">Edit ${esc(b.name)}</h3><label>Name</label><input id="n" value="${esc(b.name)}" style="width:100%"><label>Capital base (USDT) — applied when flat; an increase must fit the unallocated capital${room()}</label><input id="c" type="number" min="1" step="0.01" inputmode="decimal" value="${b.initialCapital}" style="width:100%">`,
+      ()=>{const body={name:dlg.querySelector('#n').value};const c=+dlg.querySelector('#c').value;if(c!==b.initialCapital)body.capital=c;return api('PATCH','/bots/'+id,body)},'Save');
     else if(act==='delete')modal(`<h3 style="margin-top:0">Delete ${esc(b.name)}?</h3><p class="mut">All of its data (portfolio, logs, state) is removed permanently.</p><label>When</label><select id="w" style="width:100%"><option value="after_exit">After the current trade exits</option><option value="now">Now</option></select>`,
       ()=>api('DELETE','/bots/'+id+'?when='+dlg.querySelector('#w').value),'Delete');
     else if(act==='capital-refresh'){capital=await api('GET','/capital?fresh=1');render()}
+    else if(act==='paper-capital')modal(`<h3 style="margin-top:0">Add test capital</h3><p class="mut">Credits fake USDT to the paper account. This only exists in MODE=test (data-test database); no real funds are involved.</p><label>Amount (USDT)</label><input id="a" type="number" min="1" step="0.01" inputmode="decimal" value="10000" style="width:100%">`,
+      ()=>api('POST','/paper/capital',{amount:+dlg.querySelector('#a').value}),'Add capital');
+    else if(act==='universe-refresh'){await api('POST','/universe/refresh');refresh()}
+    else if(act==='universe-save'){await api('PUT','/universe/config',{maxAssets:+$('#umax').value});refresh()}
     else if(act==='download')download(id);
     else if(act==='toggle'){open.has(id)?open.delete(id):open.add(id);refresh()}
     else if(act==='cancel'){await api('DELETE','/bots/'+id+'/pending/'+type);refresh()}

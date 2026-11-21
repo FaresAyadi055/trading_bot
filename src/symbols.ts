@@ -20,7 +20,7 @@ export async function assertTradable(symbols: string[]) {
   const down = res.find((r) => r.unavailable)
   if (down) throw new HttpError(503, `binance_unavailable: could not verify ${down.symbol} (${down.reason})`)
   const bad = res.filter((r) => !r.ok)
-  if (!bad.length && rt.live) { // the execution venue must be able to trade it too (Convert only supports a subset of assets)
+  if (!bad.length && rt.live) { // the execution venue must be able to trade it too (spot status / permissions)
     const ex = await getExchange().tradable(todo)
     const dn = ex.find((r) => r.unavailable)
     if (dn) throw new HttpError(503, `binance_unavailable: could not verify ${dn.symbol} on ${getExchange().name} (${dn.reason})`)

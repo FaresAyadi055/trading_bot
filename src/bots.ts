@@ -8,6 +8,7 @@ import { STATE_NAME, STRATEGY_NAME, P } from './params'
 import { effectiveMinScore } from './strategy'
 import { rt } from './runtime'
 import { assertAllocatable, assertBacked, recentFree } from './capital'
+import { selectedUniverse } from './universe_store'
 import type { BotRow, BotState, EvRow, Fx, PendingAction } from './types'
 import { newFx } from './types'
 import { HttpError, type CreateInput, type UpdateInput, type When } from './validate'
@@ -15,7 +16,28 @@ import { HttpError, type CreateInput, type UpdateInput, type When } from './vali
 export { HttpError }
 
 // ---------- persistence helpers ----------
-const parseBot = (r: any): BotRow => ({ ...r, assets: JSON.parse(r.assets), pending_action: r.pending_action ? JSON.parse(r.pending_action) : [] })
+/** Fill fields added after v3 so an old bot_state row can be read safely. */
+function normalizeState(raw: any): BotState {
+  const st = raw as BotState
+  st.frozenUntil = { A: st.frozenUntil?.A ?? 0 }
+  st.rHistory = { A: st.rHistory?.A ?? [] }
+  if (st.day?.signals) st.day.signals = { A: st.day.signals.A ?? 0 }
+  if (st.pending && st.pending.strategy !== 'A') st.pending = null
+  if (st.position) {
+    const p = st.position
+    p.slip ??= P.slip.mid
+    p.restingStop ??= p.hardStop ?? p.stop
+    p.maxUnrealizedR ??= 0
+    p.stopOrderId ??= null
+    p.ratcheted ??= false
+  }
+  return st
+}
+const parseBot = (r: any): BotRow => ({
+  ...r,
+  assets: JSON.parse(r.assets),
+  pending_action: (r.pending_action ? JSON.parse(r.pending_action) : []).filter((a: PendingAction) => a.type !== ('edit_assets' as any)),
+})
 export const getBot = (id: string): BotRow | null => {
   const r = db.query('SELECT * FROM bots WHERE id=?').get(id)
   return r ? parseBot(r) : null
@@ -31,7 +53,7 @@ export interface Loaded { st: BotState; last: number | null }
 export function loadState(botId: string): Loaded {
   const r = db.query('SELECT last_processed_bar, state FROM bot_state WHERE bot_id=?').get(botId) as { last_processed_bar: number | null; state: string } | null
   if (!r) return { st: newBotState(getBot(botId)?.cash ?? 0), last: null }
-  return { st: JSON.parse(r.state), last: r.last_processed_bar }
+  return { st: normalizeState(JSON.parse(r.state)), last: r.last_processed_bar }
 }
 export function saveState(botId: string, st: BotState, last: number | null) {
   db.query(`INSERT INTO bot_state(bot_id,last_processed_bar,state) VALUES(?,?,?)
@@ -71,8 +93,24 @@ export function neededSymbols(): string[] {
   for (const b of listBots()) if (b.status === 'active') for (const s of trackSet(b, loadState(b.id).st)) out.add(s)
   return [...out].sort()
 }
-/** Symbols referenced by an active bot (pulled or temporarily paused): their stored candles are kept. */
-export const referencedSymbols = (): Set<string> => new Set(listBots().filter((b) => b.status === 'active').flatMap((b) => b.assets))
+/** Symbols whose stored candles/features are kept: the selected universe plus any active bot's assets. */
+export const referencedSymbols = (): Set<string> => {
+  const out = new Set(selectedUniverse())
+  for (const b of listBots()) if (b.status === 'active') for (const s of b.assets) out.add(s)
+  return out
+}
+
+/** Push the current dynamic universe into every bot's asset snapshot (a held/pending symbol is always kept). */
+export function syncUniverseToBots() {
+  const universe = selectedUniverse()
+  const base = new Set(universe)
+  for (const b of listBots()) {
+    const { st } = loadState(b.id)
+    const lock = lockedSymbol(st)
+    const assets = lock && !base.has(lock) ? [...universe, lock].sort() : [...universe]
+    if (assets.join() !== b.assets.join()) { b.assets = assets; saveBot(b) }
+  }
+}
 
 // ---------- lifecycle ----------
 /** `free` = real free USDT of the account (fresh). Required in live mode: the new bot's capital must fit into the unallocated capital. */
@@ -82,8 +120,9 @@ export function createBot(input: CreateInput, free?: number): BotRow {
     assertAllocatable(free, input.capital, `bot capital ${input.capital}`)
   }
   const now = Date.now()
+  const assets = selectedUniverse()
   const bot: BotRow = {
-    id: randomBytes(4).toString('hex'), name: input.name ?? '', assets: input.assets, initial_capital: input.capital, cash: input.capital,
+    id: randomBytes(4).toString('hex'), name: input.name ?? '', assets, initial_capital: input.capital, cash: input.capital,
     status: input.active === false ? 'inactive' : 'active', pending_action: [], created_at: now, updated_at: now,
   }
   if (!bot.name) bot.name = `bot-${bot.id}`
@@ -93,8 +132,8 @@ export function createBot(input: CreateInput, free?: number): BotRow {
       .run(bot.id, bot.name, JSON.stringify(bot.assets), bot.initial_capital, bot.cash, bot.status, now, now)
     saveState(bot.id, newBotState(bot.cash, barIndex(live)), live)
     const fx = newFx()
-    fx.events.push({ ts: now, kind: 'created', symbol: null, detail: `${bot.assets.join(',')} capital ${bot.cash}` })
-    if (bot.status === 'active') fx.notes.push({ kind: 'lifecycle', text: M.msgLifecycle('🤖', 'BOT STARTED', bot, `${bot.assets.length} asset(s): ${bot.assets.slice(0, 12).join(', ')}${bot.assets.length > 12 ? '…' : ''}\nCapital ${M.fmt(bot.cash)} USDT · strategies Donchian (A) + VCEB (C)`) })
+    fx.events.push({ ts: now, kind: 'created', symbol: null, detail: `universe ${bot.assets.length} asset(s) capital ${bot.cash}` })
+    if (bot.status === 'active') fx.notes.push({ kind: 'lifecycle', text: M.msgLifecycle('🤖', 'BOT STARTED', bot, `Dynamic universe: ${bot.assets.length} asset(s)\nCapital ${M.fmt(bot.cash)} USDT · strategy Donchian (A)`) })
     writeFx(bot.id, fx)
   })
   return bot
@@ -110,7 +149,7 @@ function forceClose(bot: BotRow, now = Date.now()) {
   if (st.position) {
     const px = lastClose(sym)
     if (px == null) throw new HttpError(409, `no market price for ${sym} yet; try again after the next candle`)
-    closePosition(bot, st, fx, { now, fresh: true }, barIndex(bar), bar, px * (1 - P.slip), 'MANUAL')
+    closePosition(bot, st, fx, { now, fresh: true }, barIndex(bar), bar, px * (1 - st.position.slip), 'MANUAL')
   }
   st.pending = null
   fx.events.push({ ts: now, kind: 'forced_close', symbol: sym, detail: 'manual immediate action' })
@@ -154,10 +193,6 @@ function applyOne(bot: BotRow, a: PendingAction, now: number) {
       fx.tx.push({ ts: now, bar_time: null, symbol: null, action: 'CAPITAL', strategy: null, price: null, qty: null, notional: delta, fee: null, pnl: null, pnl_pct: null, r_multiple: null, exit_reason: null, cash_after: bot.cash })
       break
     }
-    case 'edit_assets':
-      bot.assets = a.assets
-      ev.push({ ts: now, kind: 'assets_changed', symbol: null, detail: a.assets.join(',') })
-      break
   }
   fx.events.push(...ev)
   writeFx(bot.id, fx)
@@ -223,17 +258,7 @@ export function updateBot(id: string, u: UpdateInput, free?: number) {
       assertAllocatable(free, u.capital - bot.initial_capital, `capital increase of ${bot.name}`)
     }
     if (u.name) bot.name = u.name
-    const when = u.when ?? 'after_exit'
     const locked = lockedSymbol(loadState(id).st)
-    if (u.assets) {
-      const conflict = !!locked && !u.assets.includes(locked)
-      if (conflict && when === 'after_exit') addPending(bot, { type: 'edit_assets', assets: u.assets, requestedAt: Date.now() })
-      else {
-        if (conflict) forceClose(bot)
-        applyOne(bot, { type: 'edit_assets', assets: u.assets, requestedAt: Date.now() }, Date.now())
-        bot.pending_action = bot.pending_action.filter((a) => a.type !== 'edit_assets')
-      }
-    }
     if (u.capital != null) {
       if (locked) addPending(bot, { type: 'set_capital', capital: u.capital, requestedAt: Date.now() }) // never mid-trade
       else applyOne(bot, { type: 'set_capital', capital: u.capital, requestedAt: Date.now() }, Date.now())
@@ -268,7 +293,7 @@ export function need(id: string): BotRow {
   return b
 }
 
-/** Drop candles/features of symbols no active bot references any more (keeps storage constant). */
+/** Drop candles/features of symbols neither the universe nor an active bot references (keeps storage constant). */
 export function gcMarketData() {
   const used = referencedSymbols()
   const stored = db.query('SELECT DISTINCT symbol FROM candles UNION SELECT symbol FROM symbol_features').all() as { symbol: string }[]
@@ -290,7 +315,7 @@ export function botView(b: BotRow) {
   const basis = b.cash + (pos?.notional ?? 0) // realised equity (open position at cost)
   const pulled = b.status === 'active' ? trackSet(b, st) : []
   return {
-    id: b.id, name: b.name, mode: b.assets.length === 1 ? 'single' : 'multi', assets: b.assets, status: b.status,
+    id: b.id, name: b.name, mode: 'universe', assets: b.assets, status: b.status,
     initialCapital: b.initial_capital, cash: b.cash, equity, lastPrice: px, realizedPnl: realized.p, closedTrades: realized.n,
     position: pos ? { ...pos, strategyName: STRATEGY_NAME[pos.strategy] } : null,
     pendingOrder: st.pending ? { ...st.pending, strategyName: STRATEGY_NAME[st.pending.strategy] } : null,
@@ -301,7 +326,7 @@ export function botView(b: BotRow) {
       cooldownLeft: st.cooldown, paused: st.pauseUntil != null, pauseUntilBar: st.pauseUntil, consecutiveLosses: st.consecutiveLosses,
       peak: st.peak, drawdownPct: st.peak > 0 ? Math.max(0, 1 - basis / st.peak) : 0,
       weekR: st.closedR.filter((x) => x.bar > bar - P.lossWindowBars).reduce((a, x) => a + x.r, 0),
-      frozen: { A: st.frozenUntil.A > bar, C: st.frozenUntil.C > bar },
+      frozen: { A: st.frozenUntil.A > bar },
     },
     counters: st.counters,
   }

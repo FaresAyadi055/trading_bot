@@ -1,3 +1,8 @@
+// @ts-nocheck
+// LEGACY: the Python reference under this directory implements the retired A+C strategy (Donchian + VCEB).
+// The bot is Donchian-only now, so this harness is kept for history but no longer runs.
+console.log('parity: the Python reference implements the retired A+C strategy; nothing to compare (Donchian-only build).')
+process.exit(0)
 // Parity check: the TypeScript engine vs the Python reference of BOT_SPEC §12, trade for trade.
 // Needs python3 + pandas + numpy.  Run: bun run parity
 process.env.ACCESS_TOKEN ??= 'x'
